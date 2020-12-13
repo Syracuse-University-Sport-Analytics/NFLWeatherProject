@@ -1,0 +1,2775 @@
+---
+title: "NFL Modeling Code"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls()) ###Clear R Environment
+
+
+
+Weather_classification_Model
+Weather_classification_Model_Gamelevel
+
+summary(Weather_probs_Model)
+Weather_probs_Model_Gamelevel
+
+library(stargazer)
+
+load("data/WeatherData.RData")
+#setwd("data/") 
+#Please make sure you have all packages below downloaded before running r script
+library(jsonlite)
+library(tidyverse)
+library(plyr)
+library(data.table)
+library(readxl)
+library(car)
+library(caret)
+library(MASS)
+library(janitor)
+library(sqldf)
+library("na.tools")
+library(mclust)
+library(stargazer)
+
+
+#x2016_2019 <- read_xlsx("PlayByPlay2016-2019.xlsx")
+#x2011_2015 <- read_xlsx("PlayByPlay2011-2015.xlsx")
+#load("WeatherOutput.RData")
+PlayByPlayData <- rbind(x2016_2019, x2011_2015)
+
+
+pbp_all_rp <- PlayByPlayData %>%
+  filter(!is_na(epa), !is_na(posteam), play_type=="no_play" | play_type=="pass" | play_type=="run") %>%
+  mutate(
+    pass = if_else(str_detect(desc, "( pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0),
+    passer_player_name = ifelse(play_type == "no_play" & pass == 1, 
+                                str_extract(desc, "(?<=\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?(?=\\s((pass)|(sack)|(scramble)))"),
+                                passer_player_name),
+    receiver_player_name = ifelse(play_type == "no_play" & str_detect(desc, "pass"), 
+                                  str_extract(desc, "(?<=to\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?"),
+                                  receiver_player_name),
+    rusher_player_name = ifelse(play_type == "no_play" & rush == 1, 
+                                str_extract(desc, "(?<=\\s)[A-Z][a-z]*\\.\\s?[A-Z][A-z]+(\\s(I{2,3})|(IV))?(?=\\s((left end)|(left tackle)|(left guard)|		      (up the middle)|(right guard)|(right tackle)|(right end)))"),
+                                rusher_player_name),
+    name = ifelse(!is_na(passer_player_name), passer_player_name, rusher_player_name),
+    yards_gained=ifelse(play_type=="no_play",NA,yards_gained),
+    play=1
+  ) %>%
+  filter(pass==1 | rush==1)
+
+
+
+
+pbp_all_rp <- pbp_all_rp %>% 
+  mutate_at(vars(home_team, away_team, posteam, defteam), funs(case_when(
+    . %in% "JAX" ~ "JAC",
+    . %in% "STL" ~ "LA",
+    . %in% "SD" ~ "LAC",
+    TRUE ~ .
+  ))) 
+
+# Get Final Scores #
+pbp_all_rp_gameresult <- aggregate(list(pbp_all_rp$away_score, pbp_all_rp$home_score), by = list(pbp_all_rp$old_game_id), max)
+pbp_all_rp_gameresult$old_game_id <-pbp_all_rp_gameresult$Group.1
+pbp_all_rp_gameresult$away_final_score <- pbp_all_rp_gameresult$c.12..12..12..12..12..12..12..12..12..12..12..12..12..12..12..
+pbp_all_rp_gameresult$home_final_score <- pbp_all_rp_gameresult$c.28..28..28..28..28..28..28..28..28..28..28..28..28..28..28..
+pbp_all_rp_gameresult$c.12..12..12..12..12..12..12..12..12..12..12..12..12..12..12.. <- NULL
+pbp_all_rp_gameresult$c.28..28..28..28..28..28..28..28..28..28..28..28..28..28..28.. <- NULL
+
+#x2011091110 <- filter(pbp_all_rp, old_game_id == 2011091110)
+#max(x2011091110$away_score) ##For validation equals
+#max(x2011091110$home_score) ##For validation
+#min(x2011_2015$game_date)
+
+#### Bring in the Weather Data ####
+
+WeatherData <- read.csv("data/games_weather.csv")
+#WeatherData <- filter(WeatherData, game_id >= 2011090800)
+WeatherData1 <- WeatherData
+WeatherData$Source <- NULL
+
+WeatherData$StationDistance <- WeatherData$DistanceToStation
+WeatherData$DistanceToStation <- NULL
+WeatherData$EstimatedCondition <- NULL
+WeatherData$TimeMeasure <- NULL
+WeatherData$WindDirection<- NULL
+########################## Replace NA values with Game Averages ################################
+#WeatherData$Temperature <- with(WeatherData, ave(WeatherData$Temperature, WeatherData$game_id,
+#                                                                          FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+
+#WeatherData$DewPoint <- with(WeatherData, ave(WeatherData$DewPoint, WeatherData$game_id,
+#                                                 FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+#WeatherData$Humidity <- with(WeatherData, ave(WeatherData$Humidity, WeatherData$game_id,
+#                                                 FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+#WeatherData$Precipitation <- with(WeatherData, ave(WeatherData$Precipitation, WeatherData$game_id,
+#                                                 FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+#WeatherData$WindSpeed <- with(WeatherData, ave(WeatherData$WindSpeed, WeatherData$game_id,
+#                                                 FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+#WeatherData$Pressure <- with(WeatherData, ave(WeatherData$Pressure, WeatherData$game_id,
+#                                                 FUN = function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))))
+#WeatherData$game_id <- as.numeric(WeatherData$game_id)
+### Median weather data group by game ###
+#WeatherDataAgg <- aggregate(WeatherData$Temperature, WeatherData$DewPoint, WeatherData$Humidity,WeatherData$Precipitation,WeatherData$WindSpeed,WeatherData$Pressure, by=list(WeatherData$game_id), FUN=median)
+
+####WeatherDataAgg <- NULL
+
+### Aggregate the weather data ###
+WeatherDataAgg <- sqldf("select 
+        game_id,
+        avg(Temperature*1.0) as Temperature,
+        avg(DewPoint*1.0) as DewPoint,
+        avg(Humidity*1.0) as Humidity,
+        avg(Precipitation*1.0) as Precipitation,
+        avg(WindSpeed*1.0) as WindSpeed,
+        avg(Pressure*1.0) as Pressure
+      from WeatherData 
+      group by game_id")
+
+WeatherDataAgg_Nas <- filter(WeatherDataAgg, is.na(Precipitation))
+WeatherDataAgg_Nas$old_game_id <- WeatherDataAgg_Nas$game_id
+WeatherDataAgg_Nas$game_id <- NULL
+####WeatherDataAgg_All_NAs$home_team
+
+
+
+## Investigate outlier game ##
+outier_game <- filter(pbp_all_rp, old_game_id == 2017111906)
+WeatherDataAgg_All_outier_game <- sqldf("select old_game_id, home_team, roof, game_date, game_stadium, home_coach, location from outier_game")
+WeatherDataAgg_All_outier_game <- distinct(WeatherDataAgg_All_outier_game)
+## End investigate outlier game ##
+
+
+library(plyr)
+WeatherDataAgg_All_NAs <- join(WeatherDataAgg_Nas, pbp_all_rp, type = "inner", match = "all")
+WeatherDataAgg_All_NAs_1 <- sqldf("select old_game_id, home_team, roof, game_date, game_stadium, home_coach, location from WeatherDataAgg_All_NAs")
+WeatherDataAgg_All_NAs_1 <- distinct(WeatherDataAgg_All_NAs_1)
+
+min(pbp_all_rp$old_game_id) #Find the oldest game in the dataset
+WeatherDataAgg <- filter(WeatherDataAgg, game_id >= 2011090800)
+
+# Perform kmeans clustering on columns 2-6 of passer_data_AYCMPS_Final data frame
+#############WeatherCluster <- kmeans(WeatherDataAgg1[, 2:7], 4, nstart = 25) 
+# Precipitation has 98 NA's. Pressure has 1.  should we replace with 0 or exclude?
+WeatherDataAgg1 <- na.omit(WeatherDataAgg) 
+sum(is.na(WeatherDataAgg$game_id)) #0 Na's
+sum(is.na(WeatherDataAgg$Temperature)) #0 Na's
+sum(is.na(WeatherDataAgg$DewPoint)) #0 Na's
+sum(is.na(WeatherDataAgg$Humidity)) #0 Na's
+sum(is.na(WeatherDataAgg$Precipitation)) #98 Na's
+sum(is.na(WeatherDataAgg$WindSpeed)) #0 Na's
+sum(is.na(WeatherDataAgg$Pressure)) #1 Na's
+WeatherDataAgg[is.na(WeatherDataAgg)] = 0
+WeatherDataAgg_Outlier_edit <- filter(WeatherDataAgg, game_id == 2017111906)
+WeatherDataAgg_Outlier_edit$Precipitation <- 0 #Replace the outlier game precipation with 0
+WeatherDataAgg1 <- na.omit(WeatherDataAgg) 
+
+# Remove the bad game with the edit #
+
+WeatherDataAgg1 <- filter(WeatherDataAgg1, game_id != 2017111906) #remove old value of outlier
+WeatherDataAgg <- filter(WeatherDataAgg, game_id != 2017111906) #remove old value of outlier
+WeatherDataAgg1 <- rbind(WeatherDataAgg1, WeatherDataAgg_Outlier_edit) #Add the fixed version of the outlier game
+WeatherDataAgg <- rbind(WeatherDataAgg, WeatherDataAgg_Outlier_edit) #Add the fixed version of the outlier game
+
+
+# Standardize the variables before clustering
+
+WeatherDataAgg$Temperature <- scale(WeatherDataAgg$Temperature)
+WeatherDataAgg$DewPoint <- scale(WeatherDataAgg$DewPoint)
+WeatherDataAgg$Humidity <- scale(WeatherDataAgg$Humidity)
+WeatherDataAgg$Precipitation <- scale(WeatherDataAgg$Precipitation)
+WeatherDataAgg$WindSpeed <- scale(WeatherDataAgg$WindSpeed)
+WeatherDataAgg$Pressure <- scale(WeatherDataAgg$Pressure)
+
+
+library(gridExtra)
+
+
+WeatherDataAgg$old_game_id <- WeatherDataAgg$game_id
+
+WeatherDataAgg2 <- join(WeatherDataAgg, pbp_all_rp, type = "inner", match = "all")
+
+WeatherDataAgg_Outlier <- filter(WeatherDataAgg1, game_id == 2017111906)
+
+#####
+WeatherDataAgg1 <- filter(WeatherDataAgg1, game_id != 2017111906)
+set.seed(123)
+
+# function to compute total within-cluster sum of square 
+wss <- function(k) {
+  kmeans(WeatherDataAgg[, 2:7], k, nstart = 10 )$tot.withinss
+}
+
+# Compute and plot wss for k = 1 to k = 15
+k.values <- 1:15
+
+# extract wss for 2-15 clusters
+wss_values <- map_dbl(k.values, wss)
+
+set.seed(123)
+plot(k.values, wss_values,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+
+set.seed(123)
+
+#fviz_nbclust(WeatherDataAgg22[, 2:7], kmeans, method = "wss")
+library(factoextra)
+
+
+
+set.seed(123)
+k3 <- kmeans(WeatherDataAgg[, 2:7], centers = 5, nstart = 25)
+k4 <- kmeans(WeatherDataAgg[, 2:7], centers = 6, nstart = 25)
+k5 <- kmeans(WeatherDataAgg[, 2:7], centers = 7, nstart = 25)
+k6 <- kmeans(WeatherDataAgg[, 2:7], centers = 8, nstart = 25)
+# plots to compare
+#p1 <- fviz_cluster(k2, geom = "point", data = WeatherDataAgg1[, 2:7]) + ggtitle("k = 2")
+p2 <- fviz_cluster(k3, geom = "point",  data = WeatherDataAgg[, 2:7]) + ggtitle("k = 5")
+p3 <- fviz_cluster(k4, geom = "point",  data = WeatherDataAgg[, 2:7]) + ggtitle("k = 6")
+p4 <- fviz_cluster(k5, geom = "point",  data = WeatherDataAgg[, 2:7]) + ggtitle("k = 7")
+p5 <- fviz_cluster(k6, geom = "point",  data = WeatherDataAgg[, 2:7]) + ggtitle("k = 8")
+
+library(gridExtra)
+grid.arrange( p2, p3, p4, p5, nrow = 2) #Plot 2-d ViZ
+WeatherDataAgg <- cbind(WeatherDataAgg, k4$cluster) #Add cluster column to WeatherDataAgg
+WeatherDataAgg$cluster <- WeatherDataAgg$`k4$cluster`
+WeatherDataAgg$`k4$cluster` <- NULL
+
+#Plot scatter plot to help visualize cluster's
+pairs(WeatherDataAgg[2:7], pch = 19,  cex = 0.5,
+      col = WeatherDataAgg$cluster,
+      lower.panel=NULL)
+unique(WeatherDataAgg$cluster)
+
+### GMM done here ###
+set.seed(1234)
+mclust23 <- Mclust(WeatherDataAgg[, 2:7]) 
+cluster_breakdown <- cbind(WeatherDataAgg, mclust23$classification) 
+summary(mclust23)
+#names(cluster_breakdown)[8] <- "mccluster"
+names(cluster_breakdown)[10] <- "mccluster"
+
+mc_prob <- cbind(cluster_breakdown$game_id, mclust23$z, mclust23$classification) %>% as.data.table()
+unique(mclust23$classification) # What are the classification's?  How many clusters?
+
+names(mc_prob) <- c("game_id", "prob_1", "prob_2", "prob_3", "prob_4", "prob_5", "prob_6", "prob_7","prob_8","cluster") #Rename columns
+#names(mc_prob) <- c("game_id", "prob_1", "prob_2", "prob_3", "prob_4", "prob_5", "prob_6", "prob_7","cluster") #Rename columns
+unique(mc_prob$cluster)
+#plot(mclust23)
+#Plot scatter plot to help visualize cluster's
+pairs(WeatherDataAgg[2:7], pch = 19,  cex = 0.5,
+      col = WeatherDataAgg$cluster,
+      lower.panel=NULL)
+unique(WeatherDataAgg$cluster)
+
+###############################
+#pbp_all_rp_filtered <- filter(pbp_all_rp, wp)
+pbp_all_rp_filtered <- filter(pbp_all_rp,between(wp, .2, .8)) #Filter to plays with 20%-80% Win Probability. This eliminates Garbage Time.
+pbp_all_rp_filtered <- filter(pbp_all_rp_filtered, season_type == "REG") #Only regular season games
+
+QB_MappingData <- read.csv("data/QBMapping.csv")
+library(plyr)
+library(sqldf)
+unique(pbp_all_rp_filtered$rusher)
+QB_MappingData$X <- NULL
+QB_MappingData$Name <- NULL
+#QB_MappingData$FirstInt <- NULL
+#QB_MappingData$Lastname <- NULL
+#QB_MappingData$Fullname <- NULL
+#The join will 
+pbp_all_rp_filtered <- join(pbp_all_rp_filtered, QB_MappingData, type = "left", match = "all")
+pbp_all_rp_filtered <- sqldf("select distinct * from pbp_all_rp_filtered")
+pbp_all_rp_filtered$HandSize <- pbp_all_rp_filtered$Hand.Size..in.
+pbp_all_rp_filtered$Height <- pbp_all_rp_filtered$Height..in.
+pbp_all_rp_filtered$Hand.Size..in. <- NULL
+pbp_all_rp_filtered$Height..in. <- NULL
+
+## Same dataset for all WP Values
+
+pbp_all_rp_noWPfilter <- join(pbp_all_rp, QB_MappingData, type = "left", match = "all")
+pbp_all_rp_noWPfilter <- sqldf("select distinct * from pbp_all_rp_noWPfilter")
+pbp_all_rp_noWPfilter$HandSize <- pbp_all_rp_noWPfilter$Hand.Size..in.
+pbp_all_rp_noWPfilter$Height <- pbp_all_rp_noWPfilter$Height..in.
+pbp_all_rp_noWPfilter$Hand.Size..in. <- NULL
+pbp_all_rp_noWPfilter$Height..in. <- NULL
+
+
+
+
+
+
+pbp_all_rp_filtered_NonNullHandsize <- sqldf("select 
+        old_game_id,
+        posteam offteam,
+        HandSize,
+        Height 
+        from pbp_all_rp_filtered")
+
+pbp_all_rp_filtered_NonNullHandsize_Agg <- aggregate(list(pbp_all_rp_filtered_NonNullHandsize$HandSize, pbp_all_rp_filtered_NonNullHandsize$Height), by = list(pbp_all_rp_filtered_NonNullHandsize$old_game_id,pbp_all_rp_filtered_NonNullHandsize$offteam), mean, na.rm=TRUE)
+pbp_all_rp_filtered_NonNullHandsize_Agg$old_game_id <- pbp_all_rp_filtered_NonNullHandsize_Agg$Group.1
+pbp_all_rp_filtered_NonNullHandsize_Agg$offteam <- pbp_all_rp_filtered_NonNullHandsize_Agg$Group.2
+pbp_all_rp_filtered_NonNullHandsize_Agg$HandSize <- pbp_all_rp_filtered_NonNullHandsize_Agg$c.9.5..NA..9.5..NA..9.88..9.88..NA..NA..9.5..NA..9.5..NA..9.5..
+pbp_all_rp_filtered_NonNullHandsize_Agg$Height <- pbp_all_rp_filtered_NonNullHandsize_Agg$c.76.75..NA..76.75..NA..74.625..74.625..NA..NA..76.75..NA..74.25..
+
+pbp_all_rp_filtered_NonNullHandsize_Agg$Group.1 <- NULL
+pbp_all_rp_filtered_NonNullHandsize_Agg$Group.2 <- NULL
+pbp_all_rp_filtered_NonNullHandsize_Agg$c.9.5..NA..9.5..NA..9.88..9.88..NA..NA..9.5..NA..9.5..NA..9.5.. <- NULL
+pbp_all_rp_filtered_NonNullHandsize_Agg$c.76.75..NA..76.75..NA..74.625..74.625..NA..NA..76.75..NA..74.25.. <- NULL
+
+Handsize_Agg_GameLevel <- pbp_all_rp_filtered_NonNullHandsize_Agg
+unique(pbp_all_rp_filtered$qtr)
+#Get data on the binned WP level #
+pbp_all_rp_WPBinned_primary <- sqldf("select 
+        old_game_id,
+        posteam offteam,
+        home_team,
+        week,
+        defteam,
+        Season,
+        roof,
+        Surface,
+        CASE 
+          WHEN ROUND(avg(CAST(wp as float)*1.0),2) BETWEEN 0.00 and 0.20 THEN '0%-20% WP'
+          WHEN ROUND(avg(CAST(wp as float)*1.0),2) BETWEEN 0.20 and 0.40 THEN '21%-40% WP'
+          WHEN ROUND(avg(CAST(wp as float)*1.0),2) BETWEEN 0.41 and 0.60 THEN '41%-60% WP'
+          WHEN ROUND(avg(CAST(wp as float)*1.0),2) BETWEEN 0.61 and 0.80 THEN '61%-80% WP'
+          WHEN ROUND(avg(CAST(wp as float)*1.0),2) BETWEEN 0.81 and 1.00 THEN '81%-100% WP'
+        ELSE 'OTHER'
+        END wp_binned,
+        qtr quarter, -- 5 is OT -- 
+        CASE WHEN posteam = home_team THEN spread_line * -1 ELSE spread_line END spread_line, -- Multiply by negative 1 bc according to documentation positive number indicated the home team was favored by that many points, and negative means the away team was favored by that many points
+        total_line,
+        game_stadium,
+        SUM(EPA) / (NULLIF(SUM(1),0)*1.0) EPA_Play,
+        SUM(EPA) sum_EPA,
+        SUM(rush_attempt) / (NULLIF((SUM(rush_attempt) + SUM(pass_attempt)),0)*1.0) RunPct
+      from pbp_all_rp_noWPfilter 
+      where 1=1
+      and qb_kneel = 0
+      and qb_spike = 0
+      and wp is not null
+      and EPA is not null
+      and (play_type = 'pass' OR play_type = 'run')  
+      and season_type = 'REG'
+      and down <> 'NA'
+      group by old_game_id, posteam, home_team,
+        defteam,
+        qtr,
+        Season,
+        roof,
+        Surface,
+        spread_line,
+        total_line,
+        game_stadium                              
+                                     ")
+
+
+library(plyr)
+
+# get the data on the game level
+pbp_all_rp_filtered_primary <- sqldf("select 
+        old_game_id,
+        posteam offteam,
+        home_team,
+        week,
+    --    CASE 
+    --      WHEN down in ('1','2') Then '1st/2nd Down'
+    --      WHEN down in ('3','4') Then '3rd/4th Down'
+    --      ELSE 'NA'
+    --    END down,
+     --   passer,
+        defteam,
+        Season,
+        roof,
+        Surface,
+        CASE WHEN posteam = home_team THEN spread_line * -1 ELSE spread_line END spread_line, -- Multiply by negative 1 bc according to documentation positive number indicated the home team was favored by that many points, and negative means the away team was favored by that many points
+        total_line,
+        game_stadium,
+        SUM(EPA) / (NULLIF(SUM(1),0)*1.0) EPA_Play,
+        SUM(EPA) sum_EPA,
+        SUM(rush_attempt) / (NULLIF((SUM(rush_attempt) + SUM(pass_attempt)),0)*1.0) RunPct
+      from pbp_all_rp_filtered 
+      where 1=1
+      and qb_kneel = 0
+      and qb_spike = 0
+      and EPA is not null
+     -- and penalty = 0
+      and (play_type = 'pass' OR play_type = 'run')  
+      and season_type = 'REG'
+      and down <> 'NA'
+      group by old_game_id, posteam, home_team,
+        defteam,
+  --      CASE 
+  --        WHEN down in ('1','2') Then '1st/2nd Down'
+  --        WHEN down in ('3','4') Then '3rd/4th Down'
+  --        ELSE 'NA'
+  --      END,
+        Season,
+        roof,
+        Surface,
+        spread_line,
+        total_line,
+        game_stadium                              
+                                     ")
+
+
+
+
+mc_prob$old_game_id <- mc_prob$game_id #Create a new column called old_game_id. This will help join the data frames.
+
+
+pbp_all_rp_filtered$game_id <- NULL #Remove game_id column.  The column is not equal to mc_prob$game_id, so we need to remove it.
+Final_DF <- join(pbp_all_rp_filtered, mc_prob, type = "inner", match = "all")
+#Final_DF <- na.omit(Final_DF)
+
+#Play By Play Data
+Final_DF_PlayByPlay <- Final_DF
+
+Final_DF_PlayByPlay$roof <- gsub("closed","dome",Final_DF_PlayByPlay$roof) #replace closed value with dome
+Final_DF_PlayByPlay$roof <- gsub("outdoors","open",Final_DF_PlayByPlay$roof) #replace outdoors value with open
+
+Final_DF_PlayByPlay$roof <- ifelse(Final_DF_PlayByPlay$roof =="dome", 1,0)
+Final_DF_PlayByPlay$prob_1 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_1)
+Final_DF_PlayByPlay$prob_2 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_2)
+Final_DF_PlayByPlay$prob_3 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_3)
+Final_DF_PlayByPlay$prob_4 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_4)
+Final_DF_PlayByPlay$prob_5 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_5)
+Final_DF_PlayByPlay$prob_6 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_6)
+Final_DF_PlayByPlay$prob_7 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_7)
+Final_DF_PlayByPlay$prob_8 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0,Final_DF_PlayByPlay$prob_8)
+
+
+
+Final_DF_PlayByPlay$cluster_1 <- ifelse(Final_DF_PlayByPlay$cluster == 1, 1, 0)
+Final_DF_PlayByPlay$cluster_2 <- ifelse(Final_DF_PlayByPlay$cluster == 2, 1, 0)
+Final_DF_PlayByPlay$cluster_3 <- ifelse(Final_DF_PlayByPlay$cluster == 3, 1, 0)
+Final_DF_PlayByPlay$cluster_4 <- ifelse(Final_DF_PlayByPlay$cluster == 4, 1, 0)
+Final_DF_PlayByPlay$cluster_5 <- ifelse(Final_DF_PlayByPlay$cluster == 5, 1, 0)
+Final_DF_PlayByPlay$cluster_6 <- ifelse(Final_DF_PlayByPlay$cluster == 6, 1, 0)
+Final_DF_PlayByPlay$cluster_7 <- ifelse(Final_DF_PlayByPlay$cluster == 7, 1, 0)
+Final_DF_PlayByPlay$cluster_8 <- ifelse(Final_DF_PlayByPlay$cluster == 8, 1, 0)
+
+
+Final_DF_PlayByPlay$cluster_1 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_1)
+Final_DF_PlayByPlay$cluster_2 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_2)
+Final_DF_PlayByPlay$cluster_3 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_3)
+Final_DF_PlayByPlay$cluster_4 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_4)
+Final_DF_PlayByPlay$cluster_5 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_5)
+Final_DF_PlayByPlay$cluster_6 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_6)
+Final_DF_PlayByPlay$cluster_7 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_7)
+Final_DF_PlayByPlay$cluster_8 <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_8)
+
+
+#Final_DF_PlayByPlay$Surface <- ifelse(Final_DF_PlayByPlay$roof == 1, 0, Final_DF_PlayByPlay$cluster_8)
+
+
+Final_DF_PlayByPlay$cieling <- Final_DF_PlayByPlay$roof
+Final_DF_PlayByPlay$passer_id
+Final_DF_PlayByPlay$HandSize
+
+###### Below is all variables needed for full model ######
+#EPA ~ (Run (Dummy) + passer_id + QB_HandSize + QB_Height + QB_Weight + spread_line +total_line +offteam +defteam +Season +Surface + roof + stadium + home team):(Prob1 + Prob2 + Prob3 + Prob4 + Prob5 + Prob6 + Prob7 + Prob8 + 1)
+
+
+#Final_DF_PlayByPlay <- sqldf("SELECT season, passer_id, spread_line, total_line,  posteam offteam, defteam, Surface, stadium, home_team, prob_1, prob_2, prob_3, prob_4, prob_5, prob_6, prob_7, cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7,roof, epa, rush_attempt, pass_attempt, cluster, Height, HandSize, down from Final_DF_PlayByPlay")
+Final_DF_PlayByPlay <- sqldf("SELECT season, passer_id, spread_line, total_line,  posteam offteam, defteam, Surface, stadium, home_team, prob_1, prob_2, prob_3, prob_4, prob_5, prob_6, prob_7, prob_8, cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7, cluster_8,roof, epa, rush_attempt, pass_attempt, cluster, Height, HandSize, down from Final_DF_PlayByPlay")
+
+#Final_DF_PlayByPlay <- na.omit(Final_DF_PlayByPlay)
+
+unique(Final_DF_PlayByPlay$surface)
+Final_DF_PlayByPlay$surface <- ifelse(Final_DF_PlayByPlay$surface == "grass", 1, 0) #Grass 1 turf 0
+
+#Final_DF_PlayByPlay$epa <- as.numeric(Final_DF_PlayByPlay$EPA_Play) ##For the game level df
+
+Final_DF_PlayByPlay$epa <- as.numeric(Final_DF_PlayByPlay$epa) #for the play by play level df
+#sum(is.na(Final_DF_PlayByPlay$epa))
+#Final_DF_PlayByPlay <- na.omit(Final_DF_PlayByPlay)
+Final_DF_PlayByPlay$rush_attempt <- as.numeric(Final_DF_PlayByPlay$rush_attempt)
+Final_DF_PlayByPlay$pass_attempt <- as.numeric(Final_DF_PlayByPlay$pass_attempt)
+
+start.time <- Sys.time()
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) +as.factor(passer_id) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(offteam) + as.factor(defteam) + as.factor(surface) + as.factor(stadium) + as.factor(home_team)):(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8 + roof + 1), data = Final_DF_PlayByPlay)
+#summary(Weather_probs_Model)
+#str(Final_DF_PlayByPlay)
+
+end.time <- Sys.time()
+
+Time.Taken <- end.time - start.time
+Time.Taken
+Final_DF_PlayByPlay$HandSize
+Final_DF_PlayByPlay$Height
+unique(Final_DF_PlayByPlay$down)
+#Next line added.  VERY IMPORTANT
+Final_DF_PlayByPlay <- filter(Final_DF_PlayByPlay, down != "NA")
+Final_DF_PlayByPlay <- sqldf("SELECT *, 
+                             CASE 
+                              WHEN down IN (1,2) then '1st/2nd Down' 
+                              WHEN down IN (3,4) then '3rd/4th Down' 
+                            ELSE NULL END as downdummy
+                             FROM Final_DF_PlayByPlay")
+unique(Final_DF_PlayByPlay$down)
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+as.factor(down)*(as.factor(rush_attempt))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_PlayByPlay)
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+as.factor(downdummy)*(as.factor(rush_attempt))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_PlayByPlay)
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(as.factor(rush_attempt))*(prob_1 + prob_2 + prob_3), data = Final_DF_PlayByPlay)
+Weather_probs_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(as.factor(rush_attempt))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_PlayByPlay)
+
+summary(Weather_probs_Model)
+#str(Final_DF_PlayByPlay)
+
+
+#Weather_classification_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ as.factor(down)*(as.factor(rush_attempt))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_PlayByPlay)
+#Weather_classification_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ as.factor(downdummy)*(as.factor(rush_attempt))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_PlayByPlay)
+#Weather_classification_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (as.factor(rush_attempt))*(cluster_1 + cluster_2 + cluster_3), data = Final_DF_PlayByPlay)
+Weather_classification_Model <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (as.factor(rush_attempt))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_PlayByPlay)
+
+summary(Weather_classification_Model)
+
+stargazer(Weather_probs_Model, Weather_classification_Model, title="Impact of Weather on EPA", out = "PlayLevel (Cluster 3).txt",align=TRUE)
+
+
+######### End Play By Play #########
+
+#########  Binned WP Models #########
+########################################
+## Game Level Aggregation ##
+
+Final_DF_WPBinned <- join(pbp_all_rp_WPBinned_primary, mc_prob, type = "inner", match = "all") #This data frame is on the game level.
+
+
+Final_DF_WPBinned$roof <- gsub("closed","dome",Final_DF_WPBinned$roof) #replace closed value with dome
+Final_DF_WPBinned$roof <- gsub("outdoors","open",Final_DF_WPBinned$roof) #replace outdoors value with open
+
+Final_DF_WPBinned$roof <- ifelse(Final_DF_WPBinned$roof =="dome", 1,0)
+Final_DF_WPBinned$prob_1 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_1)
+Final_DF_WPBinned$prob_2 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_2)
+Final_DF_WPBinned$prob_3 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_3)
+Final_DF_WPBinned$prob_4 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_4)
+Final_DF_WPBinned$prob_5 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_5)
+Final_DF_WPBinned$prob_6 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_6)
+Final_DF_WPBinned$prob_7 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_7)
+Final_DF_WPBinned$prob_8 <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$prob_8)
+
+
+
+Final_DF_WPBinned$cluster_1 <- ifelse(Final_DF_WPBinned$cluster == 1, 1, 0)
+Final_DF_WPBinned$cluster_2 <- ifelse(Final_DF_WPBinned$cluster == 2, 1, 0)
+Final_DF_WPBinned$cluster_3 <- ifelse(Final_DF_WPBinned$cluster == 3, 1, 0)
+Final_DF_WPBinned$cluster_4 <- ifelse(Final_DF_WPBinned$cluster == 4, 1, 0)
+Final_DF_WPBinned$cluster_5 <- ifelse(Final_DF_WPBinned$cluster == 5, 1, 0)
+Final_DF_WPBinned$cluster_6 <- ifelse(Final_DF_WPBinned$cluster == 6, 1, 0)
+Final_DF_WPBinned$cluster_7 <- ifelse(Final_DF_WPBinned$cluster == 7, 1, 0)
+Final_DF_WPBinned$cluster_8 <- ifelse(Final_DF_WPBinned$cluster == 8, 1, 0)
+
+
+Final_DF_WPBinned$cluster_1 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_1)
+Final_DF_WPBinned$cluster_2 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_2)
+Final_DF_WPBinned$cluster_3 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_3)
+Final_DF_WPBinned$cluster_4 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_4)
+Final_DF_WPBinned$cluster_5 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_5)
+Final_DF_WPBinned$cluster_6 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_6)
+Final_DF_WPBinned$cluster_7 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_7)
+Final_DF_WPBinned$cluster_8 <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_8)
+
+
+#Final_DF_WPBinned$Surface <- ifelse(Final_DF_WPBinned$roof == 1, 0, Final_DF_WPBinned$cluster_8)
+
+
+Final_DF_WPBinned$cieling <- Final_DF_WPBinned$roof
+F#inal_DF_GameLevel$passer_id
+
+
+
+#EPA ~ (Run (Dummy) + passer_id + QB_HandSize + QB_Height + QB_Weight + spread_line +total_line +offteam +defteam +Season +Surface + roof + stadium + home team):(Prob1 + Prob2 + Prob3 + Prob4 + Prob5 + Prob6 + Prob7 + Prob8 + 1)
+
+#Final_DF_WPBinned$cluster <- ifelse(Final_DF_WPBinned$roof == 1, 0,Final_DF_WPBinned$cluster)
+#Final_DF_WPBinned$epa <- na.omit(Final_DF_WPBinned$epa)
+#Final_DF_WPBinned <- sqldf("SELECT old_game_id, season, spread_line, total_line, offteam, defteam, Surface, game_stadium, home_team, prob_1, prob_2, prob_3, cluster_1, cluster_2, cluster_3, roof, EPA_Play, RunPct, cluster from Final_DF_WPBinned")
+Final_DF_WPBinned <- sqldf("SELECT old_game_id, week,season, spread_line, total_line, 
+                            avg(total_line*1.0) OVER (PARTITION BY cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7,roof) AvgLineByCluster,
+                            total_line - avg(total_line*1.0) OVER (PARTITION BY cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7,roof) AdjustedTotalLine,
+                            offteam, defteam, Surface, game_stadium, wp_binned, quarter,
+                            home_team, prob_1, prob_2, prob_3, prob_4, prob_5, prob_6, prob_7, cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7,roof, EPA_Play, RunPct, cluster from Final_DF_WPBinned")
+#Re add cluster 8 and prob_8 above
+
+Final_DF_WPBinned$away_team <- Final_DF_WPBinned$offteam
+Final_DF_WPBinned$away_team[Final_DF_WPBinned$away_team == Final_DF_WPBinned$home_team] <- Final_DF_WPBinned$defteam[Final_DF_WPBinned$away_team == Final_DF_WPBinned$home_team]
+#Final_DF_WPBinned <- na.omit(Final_DF_WPBinned)
+
+Final_DF_WPBinned <- join(Final_DF_WPBinned, Handsize_Agg_GameLevel, type = "inner", match = "all")
+
+
+Final_DF_WPBinned$surface <- ifelse(Final_DF_WPBinned$surface == "grass", 1, 0) #Grass 1 turf 0
+
+Final_DF_WPBinned$epa <- as.numeric(Final_DF_WPBinned$EPA_Play) ##For the game level df
+
+sum(is.na(Final_DF_WPBinned$epa))
+#Final_DF_GameLevel <- na.omit(Final_DF_GameLevel)
+
+start.time <- Sys.time()
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) + RunPct + I(RunPct^2) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(offteam) + as.factor(defteam) + as.factor(surface) + as.factor(stadium) + as.factor(home_team)):(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8 + 1), data = Final_DF_GameLevel)
+#summary(Weather_probs_Model)
+#str(Final_DF_GameLevel)
+
+end.time <- Sys.time()
+
+Time.Taken <- end.time - start.time
+Time.Taken
+Final_DF_WPBinned$Height
+
+ExpectedHandSize_Model_WP <- lm(HandSize ~ Height,Final_DF_WPBinned)
+summary(ExpectedHandSize_Model_WP)
+Final_DF_WPBinned$ExpectedHandSize <- predict(ExpectedHandSize_Model_WP, newdata = Final_DF_WPBinned)
+Final_DF_WPBinned$HandSizeOverExpected <- Final_DF_WPBinned$HandSize- Final_DF_WPBinned$ExpectedHandSize
+
+unique(Final_DF_WPBinned$wp_binned)
+
+Final_DF_WPBinned$wp_binned <- as.factor(Final_DF_WPBinned$wp_binned)
+Final_DF_WPBinned <- within(Final_DF_WPBinned, wp_binned <- relevel(wp_binned, ref = 3))
+
+#Weather_probs_Model_WP_level <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (Height  + I(Height^2)+ RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_WPBinned)
+Weather_probs_Model_WP_Gamelevel <- lm(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct:wp_binned + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8) , data = Final_DF_WPBinned)
+#Weather_probs_Model_WP_level <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(home_team))+ (RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_WPBinned)
+Weather_probs_Model_WP_Gamelevel_ForStep <- lm(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct:wp_binned + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned))
+#Weather_probs_Model_WP_Gamelevel_ForStep <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(home_team))+ (RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned))
+
+
+
+##Weather_probs_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_GameLevel)
+summary(Weather_probs_Model_WP_Gamelevel) 
+#Final_DF_GameLevel11 <- Final_DF_GameLevel
+#Final_DF_GameLevel11 <- na.omit(Final_DF_GameLevel11)
+library(caret)
+library(leaps)
+library(MASS)
+step.Weather_probs_Model_WP <- stepAIC(Weather_probs_Model_WP_Gamelevel_ForStep, direction = "both", 
+                                              trace = FALSE)
+summary(step.Weather_probs_Model_WP)
+
+
+
+#str(Final_DF_GameLevel)
+#write.csv(Final_DF_GameLevel, "Final_DF_GameLevel.csv")
+Weather_classification_Model_WPlevel <- lm(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct:wp_binned + I(RunPct^2):wp_binned) + (RunPct:wp_binned + I(RunPct^2):wp_binned)*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_WPBinned)
+#Weather_classification_Model_WPlevel <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+
+Weather_classification_Model_WPlevel_ForStep <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct:wp_binned + I(RunPct^2):wp_binned)  +(RunPct:wp_binned + I(RunPct^2):wp_binned)*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_WPBinned))
+#Weather_classification_Model_WPlevel_ForStep <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected +  as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel))
+
+
+##Weather_classification_Model_WPlevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+summary(Weather_classification_Model_WPlevel)
+
+
+step.Weather_classification_Model_WPlevel <- stepAIC(Weather_classification_Model_WPlevel_ForStep, direction = "both", 
+                                                       trace = FALSE)
+summary(step.Weather_classification_Model_WPlevel)
+
+stargazer(Weather_classification_Model_WPlevel, Weather_classification_Model_WPlevel, title="Impact of Weather on EPA", out = "Quarter Level (squared wpa interaction).txt",align=TRUE)
+stargazer(step.Weather_probs_Model_WP, step.Weather_classification_Model_WPlevel, title="Impact of Weather on EPA", out = "Quarter Level (Stepwise squared wpa interaction ).txt",align=TRUE)
+
+########################################
+######### End Binned WP Models #########
+
+## Game Level Aggregation ##
+Final_DF_GameLevel <- join(pbp_all_rp_filtered_primary, mc_prob, type = "inner", match = "all") #This data frame is on the game level.
+
+
+Final_DF_GameLevel$roof <- gsub("closed","dome",Final_DF_GameLevel$roof) #replace closed value with dome
+Final_DF_GameLevel$roof <- gsub("outdoors","open",Final_DF_GameLevel$roof) #replace outdoors value with open
+
+Final_DF_GameLevel$roof <- ifelse(Final_DF_GameLevel$roof =="dome", 1,0)
+Final_DF_GameLevel$prob_1 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_1)
+Final_DF_GameLevel$prob_2 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_2)
+Final_DF_GameLevel$prob_3 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_3)
+Final_DF_GameLevel$prob_4 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_4)
+Final_DF_GameLevel$prob_5 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_5)
+Final_DF_GameLevel$prob_6 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_6)
+Final_DF_GameLevel$prob_7 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_7)
+Final_DF_GameLevel$prob_8 <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$prob_8)
+
+
+
+Final_DF_GameLevel$cluster_1 <- ifelse(Final_DF_GameLevel$cluster == 1, 1, 0)
+Final_DF_GameLevel$cluster_2 <- ifelse(Final_DF_GameLevel$cluster == 2, 1, 0)
+Final_DF_GameLevel$cluster_3 <- ifelse(Final_DF_GameLevel$cluster == 3, 1, 0)
+Final_DF_GameLevel$cluster_4 <- ifelse(Final_DF_GameLevel$cluster == 4, 1, 0)
+Final_DF_GameLevel$cluster_5 <- ifelse(Final_DF_GameLevel$cluster == 5, 1, 0)
+Final_DF_GameLevel$cluster_6 <- ifelse(Final_DF_GameLevel$cluster == 6, 1, 0)
+Final_DF_GameLevel$cluster_7 <- ifelse(Final_DF_GameLevel$cluster == 7, 1, 0)
+Final_DF_GameLevel$cluster_8 <- ifelse(Final_DF_GameLevel$cluster == 8, 1, 0)
+
+
+Final_DF_GameLevel$cluster_1 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_1)
+Final_DF_GameLevel$cluster_2 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_2)
+Final_DF_GameLevel$cluster_3 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_3)
+Final_DF_GameLevel$cluster_4 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_4)
+Final_DF_GameLevel$cluster_5 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_5)
+Final_DF_GameLevel$cluster_6 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_6)
+Final_DF_GameLevel$cluster_7 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_7)
+Final_DF_GameLevel$cluster_8 <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_8)
+
+
+#Final_DF_GameLevel$Surface <- ifelse(Final_DF_GameLevel$roof == 1, 0, Final_DF_GameLevel$cluster_8)
+
+
+Final_DF_GameLevel$cieling <- Final_DF_GameLevel$roof
+#Final_DF_GameLevel$passer_id
+
+
+
+#EPA ~ (Run (Dummy) + passer_id + QB_HandSize + QB_Height + QB_Weight + spread_line +total_line +offteam +defteam +Season +Surface + roof + stadium + home team):(Prob1 + Prob2 + Prob3 + Prob4 + Prob5 + Prob6 + Prob7 + Prob8 + 1)
+
+#Final_DF_GameLevel$cluster <- ifelse(Final_DF_GameLevel$roof == 1, 0,Final_DF_GameLevel$cluster)
+#Final_DF_GameLevel$epa <- na.omit(Final_DF_GameLevel$epa)
+#Final_DF_GameLevel <- sqldf("SELECT old_game_id, season, spread_line, total_line, offteam, defteam, Surface, game_stadium, home_team, prob_1, prob_2, prob_3, cluster_1, cluster_2, cluster_3, roof, EPA_Play, RunPct, cluster from Final_DF_GameLevel")
+Final_DF_GameLevel <- sqldf("SELECT old_game_id, week,season, spread_line, total_line, 
+                            avg(total_line*1.0) OVER (PARTITION BY cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7, cluster_8,roof) AvgLineByCluster,
+                            total_line - avg(total_line*1.0) OVER (PARTITION BY cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7, cluster_8,roof) AdjustedTotalLine,
+                            offteam, defteam, Surface, game_stadium, 
+                            home_team, prob_1, prob_2, prob_3, prob_4, prob_5, prob_6, prob_7, prob_8, cluster_1, cluster_2, cluster_3, cluster_4, cluster_5, cluster_6, cluster_7, cluster_8 ,roof, EPA_Play, RunPct, cluster from Final_DF_GameLevel")
+#Re add Cluster_8 and prob_8
+
+Final_DF_GameLevel$away_team <- Final_DF_GameLevel$offteam
+Final_DF_GameLevel$away_team[Final_DF_GameLevel$away_team == Final_DF_GameLevel$home_team] <- Final_DF_GameLevel$defteam[Final_DF_GameLevel$away_team == Final_DF_GameLevel$home_team]
+#Final_DF_GameLevel <- na.omit(Final_DF_GameLevel)
+
+Final_DF_GameLevel <- join(Final_DF_GameLevel, Handsize_Agg_GameLevel, type = "inner", match = "all")
+
+unique(Final_DF_GameLevel$down)
+Final_DF_GameLevel$surface <- ifelse(Final_DF_GameLevel$surface == "grass", 1, 0) #Grass 1 turf 0
+
+Final_DF_GameLevel$epa <- as.numeric(Final_DF_GameLevel$EPA_Play) ##For the game level df
+
+sum(is.na(Final_DF_GameLevel$epa))
+#Final_DF_GameLevel <- na.omit(Final_DF_GameLevel)
+
+start.time <- Sys.time()
+#Weather_probs_Model <- lm(epa ~  (as.factor(season) + RunPct + I(RunPct^2) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(offteam) + as.factor(defteam) + as.factor(surface) + as.factor(stadium) + as.factor(home_team)):(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8 + 1), data = Final_DF_GameLevel)
+#summary(Weather_probs_Model)
+#str(Final_DF_GameLevel)
+
+end.time <- Sys.time()
+
+Time.Taken <- end.time - start.time
+Time.Taken
+
+
+ExpectedHandSize_Model <- lm(HandSize ~ Height,Final_DF_GameLevel)
+summary(ExpectedHandSize_Model)
+Final_DF_GameLevel$ExpectedHandSize <- predict(ExpectedHandSize_Model, newdata = Final_DF_GameLevel)
+Final_DF_GameLevel$HandSizeOverExpected <- Final_DF_GameLevel$HandSize- Final_DF_GameLevel$ExpectedHandSize
+
+
+Weather_probs_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_GameLevel)
+#Weather_probs_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7), data = Final_DF_GameLevel)
+#add prob_8 below
+#Weather_probs_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7), data = na.omit(Final_DF_GameLevel))
+Weather_probs_Model_Gamelevel_ForStep <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel))
+
+
+
+##Weather_probs_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_GameLevel)
+summary(Weather_probs_Model_Gamelevel) 
+#Final_DF_GameLevel11 <- Final_DF_GameLevel
+#Final_DF_GameLevel11 <- na.omit(Final_DF_GameLevel11)
+library(caret)
+library(leaps)
+library(MASS)
+step.Weather_probs_Model_Gamelevel <- stepAIC(Weather_probs_Model_Gamelevel_ForStep, direction = "both", 
+                      trace = FALSE)
+summary(step.Weather_probs_Model_Gamelevel)
+
+
+
+#str(Final_DF_GameLevel)
+#write.csv(Final_DF_GameLevel, "Final_DF_GameLevel.csv")
+# Add Cluster_8 below
+#Weather_classification_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = Final_DF_GameLevel)
+Weather_classification_Model_Gamelevel <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+# Add Cluster_8 below
+#Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_GameLevel))
+Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (interaction(as.factor(season),as.factor(defteam)) + interaction(as.factor(season),as.factor(offteam)) + + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected +  as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel))
+
+
+##Weather_classification_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+summary(Weather_classification_Model_Gamelevel)
+
+
+step.Weather_classification_Model_Gamelevel <- stepAIC(Weather_classification_Model_Gamelevel_ForStep, direction = "both", 
+                                              trace = FALSE)
+summary(step.Weather_classification_Model_Gamelevel)
+
+stargazer(Weather_probs_Model_Gamelevel, Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (Altered Clusters).txt",align=TRUE)
+stargazer(step.Weather_probs_Model_Gamelevel, step.Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (Altered Clusters Stepwise).txt",align=TRUE)
+## Create Summary Table ##
+library(qwraps2)
+#epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+GameLevel_SummaryTable <- Final_DF_GameLevel
+
+GameLevel_SummaryTable$old_game_id <- NULL
+GameLevel_SummaryTable$season <- as.factor(GameLevel_SummaryTable$season)
+stargazer(GameLevel_SummaryTable, out = "data/SummaryStatsTable.txt", summary=TRUE, rownames=FALSE)
+
+
+
+
+whole <- summary_table(GameLevel_SummaryTable, our_summary1)
+write.table(whole, file = "data/SummaryTable.txt", sep = ",", quote = FALSE, row.names = F)
+#whole <- summary_table(our_summary1)
+plot(whole)
+whole
+GameLevel_SummaryTable$cluster
+### By number of clusters
+#by_cyl <- summary_table(dplyr::group_by(GameLevel_SummaryTable, GameLevel_SummaryTable$cluster), our_summary1)
+#by_cyl
+
+
+## End Create Summary Table ##
+## End of GAME LEVEL AGGREGATION ##
+
+
+
+### F-Test ###
+Only_Weather_Prob_Model <- lm(epa ~ prob_1 + prob_2 + prob_3 + prob_5 + prob_6 + prob_8, data = Final_DF_GameLevel)
+#summary(Weather_probs_Model_Gamelevel)
+summary(Only_Weather_Prob_Model)
+
+
+Only_Weather_Cluster_Model <- lm(epa ~ cluster_1 + cluster_2 + cluster_3  + cluster_5 + cluster_6 + cluster_8, data = Final_DF_GameLevel)
+#summary(Weather_classification_Model_Gamelevel)
+summary(Only_Weather_Cluster_Model)
+
+
+
+save.image(file='UpdatedWeatherOutputData.RData')
+save.image(file = "WeatherOutput.RData")
+library(car)
+test_sign_Probs <- c("prob_1", "prob_2", "prob_3", "prob_5", "prob_6", "prob_8")
+linearHypothesis(Only_Weather_Prob_Model, test_sign)
+
+test_sign_Clusters <- c("cluster_1", "cluster_2", "cluster_3", "cluster_5", "cluster_6", "cluster_8")
+linearHypothesis(Only_Weather_Cluster_Model, test_sign_Clusters)
+
+
+
+
+
+### The rest of code was to make tables for Shankar ###
+
+
+
+#load("WeatherOutput.RData")
+### 
+## QB Data
+#QB_data <- read.csv("qb.csv")
+#Final_DF$passer
+#Final_DF$passer_player_name
+#Final_DF$passer_player_id
+#Final_DF$passer_id
+##Passer and passer_player_name may have different values.  Diffault to Passer and passer_id
+#Distinct_QBData <- sqldf("SELECT DISTINCT passer, passer_id, posteam, Season FROM Final_DF WHERE passer <> 'NA'")
+#QB_data$Name
+#QB_data$FirstInt <- substr(QB_data$Name, 1,1)
+#QB_data$FirstInt <- paste(QB_data$FirstInt, ".")
+##QB_data$FirstInt <- gsub(QB_data$FirstInt, " ")
+#QB_data$FirstInt <- gsub(" ", "", QB_data$FirstInt)
+
+##QB_data$FirstInt <- gsub(" ","",QB_data$FirstInt)
+#nchar(QB_data$FirstInt)
+#QB_data$Lastname <- sapply(strsplit(QB_data$Name, ' '), function(x) x[length(x)])
+#QB_data$Fullname <- paste(QB_data$FirstInt, QB_data$Lastname)
+#QB_data$Fullname <- gsub(" ", "", QB_data$Fullname)
+#QB_data$passer <- QB_data$Fullname
+
+#QBALL <- merge(x = Distinct_QBData, y = QB_data, by = "passer", all.x = TRUE)
+#write.csv(QBALL, "QBMapping.csv")
+
+
+
+
+######## Weather summary Statistics ######## 
+
+
+
+#### Bring in the Weather Data Different Data Name ####
+
+WeatherData_SummaryStats <- read.csv("data/games_weather.csv")
+#WeatherData <- filter(WeatherData, game_id >= 2011090800)
+
+WeatherData_SummaryStats$Source <- NULL
+
+WeatherData_SummaryStats$StationDistance <- WeatherData_SummaryStats$DistanceToStation
+WeatherData_SummaryStats$DistanceToStation <- NULL
+WeatherData_SummaryStats$EstimatedCondition <- NULL
+WeatherData_SummaryStats$TimeMeasure <- NULL
+WeatherData_SummaryStats$WindDirection<- NULL
+
+
+### Aggregate the weather data ###
+WeatherData_SummaryStatsAgg <- sqldf("select 
+        game_id,
+        avg(Temperature*1.0) as Temperature,
+        avg(DewPoint*1.0) as DewPoint,
+        avg(Humidity*1.0) as Humidity,
+        avg(Precipitation*1.0) as Precipitation,
+        avg(WindSpeed*1.0) as WindSpeed,
+        avg(Pressure*1.0) as Pressure
+      from WeatherData_SummaryStats 
+      group by game_id")
+
+WeatherData_SummaryStatsAgg_Nas <- filter(WeatherData_SummaryStatsAgg, is.na(Precipitation))
+WeatherData_SummaryStatsAgg_Nas$old_game_id <- WeatherData_SummaryStatsAgg_Nas$game_id
+WeatherData_SummaryStatsAgg_Nas$game_id <- NULL
+####WeatherDataAgg_All_NAs$home_team
+
+
+
+## Investigate outlier game ##
+outier_game <- filter(pbp_all_rp, old_game_id == 2017111906)
+WeatherData_SummaryStatsAggoutier_game <- sqldf("select old_game_id, home_team, roof, game_date, game_stadium, home_coach, location from outier_game")
+WeatherData_SummaryStatsAggoutier_game <- distinct(WeatherData_SummaryStatsAggoutier_game)
+## End investigate outlier game ##
+
+
+library(plyr)
+WeatherData_SummaryStatsAgg_Nas <- join(WeatherData_SummaryStatsAgg_Nas, pbp_all_rp, type = "inner", match = "all")
+WeatherData_SummaryStatsAgg_Nas_1 <- sqldf("select old_game_id, home_team, roof, game_date, game_stadium, home_coach, location from WeatherData_SummaryStatsAgg_Nas")
+WeatherData_SummaryStatsAgg_Nas_1 <- distinct(WeatherData_SummaryStatsAgg_Nas_1)
+
+min(pbp_all_rp$old_game_id) #Find the oldest game in the dataset
+WeatherData_SummaryStatsAgg <- filter(WeatherData_SummaryStatsAgg, game_id >= 2011090800)
+
+WeatherDataAgg1 <- na.omit(WeatherDataAgg) 
+sum(is.na(WeatherDataAgg$game_id)) #0 Na's
+sum(is.na(WeatherDataAgg$Temperature)) #0 Na's
+sum(is.na(WeatherDataAgg$DewPoint)) #0 Na's
+sum(is.na(WeatherDataAgg$Humidity)) #0 Na's
+sum(is.na(WeatherDataAgg$Precipitation)) #98 Na's
+sum(is.na(WeatherDataAgg$WindSpeed)) #0 Na's
+sum(is.na(WeatherDataAgg$Pressure)) #1 Na's
+WeatherData_SummaryStatsAgg[is.na(WeatherData_SummaryStatsAgg)] = 0
+WeatherData_SummaryStatsAgg_Outlier_edit <- filter(WeatherData_SummaryStatsAgg, game_id == 2017111906)
+WeatherData_SummaryStatsAgg_Outlier_edit$Precipitation <- 0 #Replace the outlier game precipation with 0
+WeatherData_SummaryStatsAgg1 <- na.omit(WeatherData_SummaryStatsAgg) 
+
+# Remove the bad game with the edit #
+
+WeatherData_SummaryStatsAgg1 <- filter(WeatherData_SummaryStatsAgg1, game_id != 2017111906) #remove old value of outlier
+WeatherData_SummaryStatsAgg <- filter(WeatherData_SummaryStatsAgg, game_id != 2017111906) #remove old value of outlier
+WeatherData_SummaryStatsAgg1 <- rbind(WeatherData_SummaryStatsAgg1, WeatherData_SummaryStatsAgg_Outlier_edit) #Add the fixed version of the outlier game
+WeatherData_SummaryStatsAgg <- rbind(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg_Outlier_edit) #Add the fixed version of the outlier game
+WeatherData_SummaryStatsAgg <- cbind(WeatherData_SummaryStatsAgg, mc_prob)
+WeatherData_SummaryStatsAgg$game_id <- NULL
+WeatherData_SummaryStatsAgg$prob_1 <- NULL
+WeatherData_SummaryStatsAgg$prob_2 <- NULL
+WeatherData_SummaryStatsAgg$prob_3 <- NULL
+WeatherData_SummaryStatsAgg$prob_4 <- NULL
+WeatherData_SummaryStatsAgg$prob_5 <- NULL
+WeatherData_SummaryStatsAgg$prob_6 <- NULL
+WeatherData_SummaryStatsAgg$prob_7 <- NULL
+WeatherData_SummaryStatsAgg$prob_8 <- NULL
+WeatherData_SummaryStatsAgg$game_id <- NULL
+WeatherData_SummaryStatsAgg$old_game_id <- NULL
+WeatherData_SummaryStatsAgg$cluster <- as.factor(WeatherData_SummaryStatsAgg$cluster)
+
+
+
+stargazer(WeatherData_SummaryStatsAgg, out = "Weather Summary Statistics (7 clusters).txt", summary=TRUE, rownames=FALSE)
+stargazer(WeatherData_SummaryStatsAgg, out = "Weather Summary Statistics.txt")
+
+
+library(stargazer)
+library(dplyr)
+library(tidyr)
+
+WeatherData_SummaryStatsAgg %>%
+  group_by(cluster) %>%
+  #mutate(id = 1:n()) %>%
+  #ungroup() %>%
+  #gather(temp, val, len, dose) %>%
+  #unite(temp1, supp, temp, sep = '_') %>%
+  #spread(temp1, val) %>%
+  #select(-id) %>%
+  as.data.frame() %>%
+  stargazer(type = 'text')
+
+by(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster, stargazer, type = 'text', out="stat_org1.txt")
+#by(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster, stargazer), type = 'text', out="stat_org1.txt")
+
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 1),
+          title="Summary Table for Cluster 1", type = "text", out="Cluster 1.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 2),
+          title="Summary Table for Cluster 2", type = "text", out="Cluster 2.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 3),
+          title="Summary Table for Cluster 3", type = "text", out="Cluster 3.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 4),
+          title="Summary Table for Cluster 4", type = "text", out="Cluster 4.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 5),
+          title="Summary Table for Cluster 5", type = "text", out="Cluster 5.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 6),
+          title="Summary Table for Cluster 6", type = "text", out="Cluster 6.txt")
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 7),
+          title="Summary Table for Cluster 7", type = "text", out="Cluster 7.txt")
+
+stargazer(subset(WeatherData_SummaryStatsAgg, WeatherData_SummaryStatsAgg$cluster == 8),
+          title="Summary Table for Cluster 8", type = "text", out="Cluster 8 1.txt")
+
+
+WeatherData_SummaryStatsAgg
+Final_DF_GameLevel1 <- sqldf("SELECT old_game_id , SUM(1) from Final_DF_GameLevel group by old_game_id having sum(1) <2")
+Final_DF_GameLevel1 <- filter(Final_DF_GameLevel, old_game_id == "2019122205")
+unique(mc_prob$cluster)
+
+#Plot scatter plot to help visualize cluster's
+library(tidyverse)
+WeatherData_SummaryStatsAgg <- as.data.frame(WeatherData_SummaryStatsAgg)
+rownames(WeatherData_SummaryStatsAgg) <- 1:nrow(WeatherData_SummaryStatsAgg)
+
+WeatherData_SummaryStatsAgg_forViz <- read.csv("data/WeatherData_SummaryStatsAgg.csv")
+
+WeatherData_SummaryStatsAgg_forViz$cluster <- ifelse(WeatherData_SummaryStatsAgg_forViz$cluster == 4 | WeatherData_SummaryStatsAgg_forViz$cluster == 6 | WeatherData_SummaryStatsAgg_forViz$cluster == 7, WeatherData_SummaryStatsAgg_forViz$cluster, 99 )
+unique(WeatherData_SummaryStatsAgg_forViz$cluster)
+WeatherData_SummaryStatsAgg_forViz$cluster <- ifelse(WeatherData_SummaryStatsAgg_forViz$cluster == 4, "a",  WeatherData_SummaryStatsAgg_forViz$cluster)
+WeatherData_SummaryStatsAgg_forViz$cluster <- ifelse(WeatherData_SummaryStatsAgg_forViz$cluster == 6, "b",  WeatherData_SummaryStatsAgg_forViz$cluster)
+WeatherData_SummaryStatsAgg_forViz$cluster <- ifelse(WeatherData_SummaryStatsAgg_forViz$cluster == 7, "c",  WeatherData_SummaryStatsAgg_forViz$cluster)
+WeatherData_SummaryStatsAgg_forViz$cluster <- ifelse(WeatherData_SummaryStatsAgg_forViz$cluster == 99, "leagueMean",  WeatherData_SummaryStatsAgg_forViz$cluster)
+unique(WeatherData_SummaryStatsAgg_forViz$cluster)
+#WeatherData_SummaryStatsAgg_forViz <- filter(WeatherData_SummaryStatsAgg, cluster != 1 )
+#WeatherData_SummaryStatsAgg_forViz <- filter(WeatherData_SummaryStatsAgg_forViz, cluster != 1 & cluster != 2 & cluster != 3 & cluster != 5 & cluster != 8)
+
+WeatherData_SummaryStatsAgg_forViz$X <- NULL
+
+a <- "#FF5A5F"
+
+b <- "#FFB400"
+
+c <- "#007A87"
+
+leagueMean <- "#8CE071"
+
+#hereâs how you can use them in ggplot:
+
+#scale_fill_manual(values=c(a, b, c))
+
+#scale_color_manual(values=c(a, b, c))
+cols <- character(nrow(WeatherData_SummaryStatsAgg_forViz))
+cols[] <- "FF5A5F"
+cols[WeatherData_SummaryStatsAgg_forViz$cluster == "a"] <- a
+cols[WeatherData_SummaryStatsAgg_forViz$cluster == "b"] <- b
+cols[WeatherData_SummaryStatsAgg_forViz$cluster == "c"] <- c
+cols[WeatherData_SummaryStatsAgg_forViz$cluster == "leagueMean"] <- leagueMean
+
+pairs(WeatherData_SummaryStatsAgg_forViz[2:7], pch = 19,  cex = 0.5,
+      col = cols,
+      lower.panel=NULL)
+
+
+WeatherData_SummaryStatsAgg_forViz <- read.csv("data/WeatherData_SummaryStatsAgg.csv")
+WeatherData_SummaryStatsAgg_forViz$X <- NULL
+WeatherData_SummaryStatsAgg_forViz <- filter(as.data.frame(weather_data), cluster != 1 & cluster != 2 & cluster != 3 & cluster != 5 & cluster != 8)
+
+WeatherData_SummaryStatsAgg_forViz %>% dplyr::rename(raw_cluster = cluster) %>% mutate(Cluster = ifelse(raw_cluster==4, 1, ifelse(raw_cluster==6, 2,ifelse(raw_cluster==7,3,NA)))) %>% filter(Cluster != "") -> WeatherData_SummaryStatsAgg_forViz
+
+
+
+
+
+a <- "#FF5A5F"
+
+b <- "#FFB400"
+
+c <- "#007A87"
+
+pairs(WeatherData_SummaryStatsAgg_forViz[2:7], pch = 19,  cex = 0.5,
+      
+      col = c(a, b, c)[WeatherData_SummaryStatsAgg_forViz$Cluster],
+      
+      lower.panel=NULL)
+
+par(xpd=TRUE)
+legend("bottomleft", fill = unique(WeatherData_SummaryStatsAgg_forViz$Cluster), legend = c(a,b,c))
+
+legend(0.55, 1, as.vector(unique(WeatherData_SummaryStatsAgg_forViz$Cluster)),  fill=(a,b,c))
+
+
+
+scale_fill_manual(values=c(a, b, c))
+scale_color_manual(values=c(a, b, c))
+
+pairs(WeatherData_SummaryStatsAgg[2:7], pch = 19,  cex = 0.5,
+      col = WeatherData_SummaryStatsAgg$cluster,
+      lower.panel=NULL)
+
+
+par(xpd = TRUE)
+legend("bottomright", fill = unique(WeatherData_SummaryStatsAgg$cluster), legend = c( levels(WeatherData_SummaryStatsAgg$cluster)))
+
+legend("bottomleft", fill = unique(WeatherData_SummaryStatsAgg$cluster), legend = c((WeatherData_SummaryStatsAgg$cluster)))
+min(Final_DF_PlayByPlay_Pilot1$wp)
+
+
+#, out = "GameLevel (Final Test1).txt"
+stargazer(WeatherData_SummaryStatsAgg[2:4,], summary=FALSE, rownames=FALSE)
+
+
+library(caret)
+library(nnet)
+
+Weather_probs_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel))
+Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel))
+
+
+#6789
+
+#set.seed(5678)
+set.seed(5678)
+#trainIndex <- createDataPartition(Final_DF_GameLevel$epa, p=.7, list=F)
+#prestige.train <- Final_DF_GameLevel[trainIndex, ]
+#prestige.test <- Final_DF_GameLevel[-trainIndex, ]
+#prestige.train
+
+#starttime <- Sys.time 
+#set.seed(5678)
+#my.grid <- expand.grid(.decay = c(0.5, 0.1), .size = c(5, 6, 7))
+#set.seed(5678)
+#train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+#Final_DF_WPBinned
+#set.seed(5678)
+#prestige.fit <- train(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel),
+ #                     method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)    
+
+   
+#set.seed(5678)
+#prestige.fit_Training <- train(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(prestige.train),
+#                     method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)    
+
+
+
+#set.seed(6789)
+#prestige.fit <- train(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel),
+#                      method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)    
+
+#seeds <- vector(mode = "list", length = nrow(na.omit(Final_DF_GameLevel)) + 1)
+#seeds <- lapply(seeds, function(x) 1:20)
+#rctrl1 <- trainControl(method = "cv", number = 3, returnResamp = "all", seeds = seeds)
+#set.seed(6789)
+#test_reg_cv_form <- train(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_WPBinned),
+#                          method = "brnn", 
+#                          tuneLength = 3,
+#                          trControl = rctrl1, verbose =FALSE)
+
+### Include WPs
+#prestige.fit_WPs_Cluster
+#test_reg_cv_form_WPs_Cluster
+#set.seed(6789)
+#prestige.fit_WPs_Cluster <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned),
+#                      method = "nnet", maxit = 1000, tuneGrid = my.grid, trControl=train_control, trace = F, linout = 1)    
+
+set.seed(6789)
+fitControl <- trainControl(method = "repeatedcv", 
+                           number = 10, 
+                           repeats = 4, 
+                           classProbs = TRUE)
+set.seed(6789)
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                         decay = seq(from = 0.1, to = 0.5, by = 0.1))
+set.seed(6789)
+nnetFit_WP <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned),
+                 method = "nnet",
+                 metric = "Rsquared",
+                 trControl = fitControl,
+                 tuneGrid = nnetGrid,
+                 verbose = FALSE)
+
+set.seed(6789)
+nnetFit_NOWP <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel),
+                    method = "nnet",
+                    metric = "Rsquared",
+                    trControl = fitControl,
+                    tuneGrid = nnetGrid,
+                    verbose = FALSE)
+
+
+set.seed(6789)
+nnetFit_WP_WithBinnedWP <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ ((RunPct + I(RunPct^2) + I(RunPct^3)):wp_binned)*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned),
+                    method = "nnet",
+                    metric = "Rsquared",
+                    trControl = fitControl,
+                    tuneGrid = nnetGrid,
+                    verbose = FALSE)
+
+set.seed(6789)
+nnetFit_NOWP_Clusters <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel),
+                      method = "nnet",
+                      metric = "Rsquared",
+                      trControl = fitControl,
+                      tuneGrid = nnetGrid,
+                      verbose = FALSE)
+
+
+
+
+
+
+
+str(Final_DF_WPBinned)
+
+
+set.seed(6789)
+test_reg_cv_form_WPs_Cluster <- train(epa ~  (as.factor(season)+ as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_WPBinned),
+                          method = "brnn", 
+                          tuneLength = 3,
+                          trControl = rctrl1, verbose =FALSE)
+
+
+
+summary(prestige.fit_WPs_Cluster)
+
+
+
+
+Endtime <- Sys.time 
+Endtime
+starttime
+max(na.omit(prestige.test$RunPct))
+min(na.omit(prestige.test$RunPct))
+max(na.omit(prestige.train$RunPct))
+min(na.omit(prestige.train$RunPct))
+unique(prestige.train$offteam)
+dummy_df <- data.frame(RunPct = -1.4:1.4)
+unique(dummy_df$RunPct)
+cluster_1
+library(data.table)
+dummy_df <- CJ(spread_line=c(-14:14), 
+                       #epa = (-5.1:5.6), AdjustedTotalLine = (-11:18), 
+                       surface= c(0,1), Height = (70:79),
+                       #HandSizeOverExpected = c(-1.4, -1.3, -1.2, -1.1, -1.0, -0.9, -0.8,-0.7,-0.6,-0.5,-0.4,-0.3, -0.2,-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3), 
+                       #offteam = c("LA","PHI","ARI","KC","IND","MIN", "TB",  "CHI", "NO",  "HOU", "DET", "BAL", "PIT", "DAL", "WAS", "NYG","LV",  "GB",  "CAR", "BUF", "CLE", "SEA", "JAC", "ATL", "DEN", "SF",  "TEN", "LAC", "MIA", "NYJ", "CIN", "NE"),
+                       #defteam = c("LA","PHI","ARI","KC","IND","MIN", "TB",  "CHI", "NO",  "HOU", "DET", "BAL", "PIT", "DAL", "WAS", "NYG","LV",  "GB",  "CAR", "BUF", "CLE", "SEA", "JAC", "ATL", "DEN", "SF",  "TEN", "LAC", "MIA", "NYJ", "CIN", "NE"),
+                       #home_team = c("LA","PHI","ARI","KC","IND","MIN", "TB",  "CHI", "NO",  "HOU", "DET", "BAL", "PIT", "DAL", "WAS", "NYG","LV",  "GB",  "CAR", "BUF", "CLE", "SEA", "JAC", "ATL", "DEN", "SF",  "TEN", "LAC", "MIA", "NYJ", "CIN", "NE"),
+                       RunPct = (1:99),
+                       cluster_1 = c(0,1),
+                       cluster_2 = c(0,1),
+                       cluster_3 = c(0,1),
+                       cluster_4 = c(0,1),
+                       cluster_5 = c(0,1),
+                       cluster_6 = c(0,1),
+                       cluster_7 = c(0,1),
+                       cluster_8 = c(0,1)
+                                   )
+mean(na.omit(Final_DF_GameLevel$Height))
+sd(na.omit(Final_DF_GameLevel$Height))
+mean(na.omit(Final_DF_GameLevel$epa))
+
+
+Weather_probs_Model_Gamelevel_ForStep <- lm( ~  (as.factor() + as.numeric() + as.numeric() + as.factor() +   +  + as.factor()+ as.factor()+ as.factor())+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel))
+
+
+
+set.seed(12345)
+Height <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$Height)), sd = sd(na.omit(Final_DF_GameLevel$Height)))
+HandSizeOverExpected <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$HandSizeOverExpected)), sd = sd(na.omit(Final_DF_GameLevel$HandSizeOverExpected)))
+epa <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$epa)), sd = sd(na.omit(Final_DF_GameLevel$epa)))
+AdjustedTotalLine <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$AdjustedTotalLine)), sd = sd(na.omit(Final_DF_GameLevel$AdjustedTotalLine)))
+spread_line <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$spread_line)), sd = sd(na.omit(Final_DF_GameLevel$spread_line)))
+RunPct <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$RunPct)), sd = sd(na.omit(Final_DF_GameLevel$RunPct)))
+#surface_data <- rnorm(n = 100000, mean = 0, sd = 1)
+surface <- c(rep(unique(Final_DF_GameLevel$surface),.5*100000))
+#cluster_1_data <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_2_data <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_3_data <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_4_data  <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_5_data  <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_6_data  <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_7_data  <- rnorm(n = 100000, mean = 0, sd = 1)
+#cluster_8_data  <- rnorm(n = 100000, mean = 0, sd = 1)
+#Remove 2011 for even number
+season <- c(rep("2019",(1/8)*100000),rep("2018",(1/8)*100000),rep("2017",(1/8)*100000),rep("2016",(1/8)*100000),  rep("2015",(1/8)*100000),rep("2014",(1/8)*100000),rep("2013",(1/8)*100000), rep("2012",(1/8)*100000))
+#Team
+#season_data <- c(rep("2019",(1/8)*100000),rep("2018",(1/8)*100000),rep("2017",(1/8)*100000),rep("2016",(1/8)*100000),  rep("2015",(1/8)*100000),rep("2014",(1/8)*100000),rep("2013",(1/8)*100000), rep("2012",(1/8)*100000))
+offteam <- c(rep(unique(Final_DF_GameLevel$offteam),(1/32)*100000))
+defteam <- c(rep(unique(Final_DF_GameLevel$defteam),(1/32)*100000))
+home_team <- c(rep(unique(Final_DF_GameLevel$home_team),(1/32)*100000))
+cluster_data <- c(rep("cluster_1",(1/8)*100000),rep("cluster_2",(1/8)*100000),rep("cluster_3",(1/8)*100000),rep("cluster_4",(1/8)*100000),  rep("cluster_5",(1/8)*100000),rep("cluster_6",(1/8)*100000),rep("cluster_7",(1/8)*100000), rep("cluster_8",(1/8)*100000))
+
+##TEST MEAN ##
+Height <- mean(na.omit(Final_DF_GameLevel$Height))
+HandSizeOverExpected <-  mean(na.omit(Final_DF_GameLevel$HandSizeOverExpected))
+epa <- mean(na.omit(Final_DF_GameLevel$epa))
+AdjustedTotalLine <- mean(na.omit(Final_DF_GameLevel$AdjustedTotalLine))
+spread_line <- mean(na.omit(Final_DF_GameLevel$spread_line))
+#RunPct <- rnorm(n = 100000, mean = mean(na.omit(Final_DF_GameLevel$RunPct)), sd = sd(na.omit(Final_DF_GameLevel$RunPct)))
+#surface_data <- rnorm(n = 100000, mean = 0, sd = 1)
+surface <- median(Final_DF_GameLevel$surface)
+RunPct <- (c(1:100))
+RunPct <- RunPct / 100
+#Remove 2011 for even number
+season <- '2019'
+#Team
+#season_data <- c(rep("2019",(1/8)*100000),rep("2018",(1/8)*100000),rep("2017",(1/8)*100000),rep("2016",(1/8)*100000),  rep("2015",(1/8)*100000),rep("2014",(1/8)*100000),rep("2013",(1/8)*100000), rep("2012",(1/8)*100000))
+#offteam <- 'KC'
+#defteam <- 'IND'
+#home_team <- 'IND'
+
+offteam <- 'BAL'
+defteam <- 'MIA'
+home_team <- 'MIA'
+#cluster_data <- c(rep("cluster_1",(1/8)*100000),rep("cluster_2",(1/8)*100000),rep("cluster_3",(1/8)*100000),rep("cluster_4",(1/8)*100000),  rep("cluster_5",(1/8)*100000),rep("cluster_6",(1/8)*100000),rep("cluster_7",(1/8)*100000), rep("cluster_8",(1/8)*100000))
+
+
+
+## END TEST MEAN ##
+
+unique(Final_DF_GameLevel$season)
+
+dummy_df <- as.data.frame(cbind(Height,HandSizeOverExpected,epa, AdjustedTotalLine, spread_line, RunPct, surface, season, offteam, defteam, home_team))
+
+median(dummy_df$normalizedRunPct)
+str(dummy_df)
+str(Final_DF_GameLevel)
+dummy_df$RunPct <- as.numeric(dummy_df$RunPct)
+dummy_df$Height <- as.numeric(dummy_df$Height)
+dummy_df$HandSizeOverExpected <- as.numeric(dummy_df$HandSizeOverExpected)
+dummy_df$epa <- as.numeric(dummy_df$epa)
+dummy_df$AdjustedTotalLine <- as.numeric(dummy_df$AdjustedTotalLine)
+dummy_df$spread_line <- as.numeric(dummy_df$spread_line)
+dummy_df$surface <- as.numeric(dummy_df$surface)
+dummy_df$cluster_1 <- 1
+dummy_df$cluster_2 <- 1
+dummy_df$cluster_3 <- 1
+dummy_df$cluster_4 <- 1
+dummy_df$cluster_5 <- 1
+dummy_df$cluster_6 <- 1
+dummy_df$cluster_7 <- 1
+dummy_df$cluster_8 <- 1
+dummy_df$wp_binned <- '41%-60% WP'
+
+Cluster_1dummy_df <- dummy_df
+
+Cluster_1dummy_df$cluster_2 <- 0
+Cluster_1dummy_df$cluster_3 <- 0
+Cluster_1dummy_df$cluster_4 <- 0
+Cluster_1dummy_df$cluster_5 <- 0
+Cluster_1dummy_df$cluster_6 <- 0
+Cluster_1dummy_df$cluster_7 <- 0
+Cluster_1dummy_df$cluster_8 <- 0
+Cluster_1dummy_df$prob_1 <- 1
+Cluster_1dummy_df$prob_2 <- 0
+Cluster_1dummy_df$prob_3 <- 0
+Cluster_1dummy_df$prob_4 <- 0
+Cluster_1dummy_df$prob_5 <- 0
+Cluster_1dummy_df$prob_6 <- 0
+Cluster_1dummy_df$prob_7 <- 0
+Cluster_1dummy_df$prob_8 <- 0
+
+
+
+Cluster_2dummy_df <- dummy_df
+
+Cluster_2dummy_df$cluster_1 <- 0
+Cluster_2dummy_df$cluster_3 <- 0
+Cluster_2dummy_df$cluster_4 <- 0
+Cluster_2dummy_df$cluster_5 <- 0
+Cluster_2dummy_df$cluster_6 <- 0
+Cluster_2dummy_df$cluster_7 <- 0
+Cluster_2dummy_df$cluster_8 <- 0
+Cluster_2dummy_df$prob_1 <- 0
+Cluster_2dummy_df$prob_2 <- 1
+Cluster_2dummy_df$prob_3 <- 0
+Cluster_2dummy_df$prob_4 <- 0
+Cluster_2dummy_df$prob_5 <- 0
+Cluster_2dummy_df$prob_6 <- 0
+Cluster_2dummy_df$prob_7 <- 0
+Cluster_2dummy_df$prob_8 <- 0
+
+Cluster_3dummy_df <- dummy_df
+
+Cluster_3dummy_df$cluster_1 <- 0
+Cluster_3dummy_df$cluster_2 <- 0
+Cluster_3dummy_df$cluster_4 <- 0
+Cluster_3dummy_df$cluster_5 <- 0
+Cluster_3dummy_df$cluster_6 <- 0
+Cluster_3dummy_df$cluster_7 <- 0
+Cluster_3dummy_df$cluster_8 <- 0
+Cluster_3dummy_df$prob_1 <- 0
+Cluster_3dummy_df$prob_2 <- 0
+Cluster_3dummy_df$prob_3 <- 1
+Cluster_3dummy_df$prob_4 <- 0
+Cluster_3dummy_df$prob_5 <- 0
+Cluster_3dummy_df$prob_6 <- 0
+Cluster_3dummy_df$prob_7 <- 0
+Cluster_3dummy_df$prob_8 <- 0
+
+
+Cluster_4dummy_df <- dummy_df
+
+Cluster_4dummy_df$cluster_1 <- 0
+Cluster_4dummy_df$cluster_2 <- 0
+Cluster_4dummy_df$cluster_3 <- 0
+Cluster_4dummy_df$cluster_5 <- 0
+Cluster_4dummy_df$cluster_6 <- 0
+Cluster_4dummy_df$cluster_7 <- 0
+Cluster_4dummy_df$cluster_8 <- 0
+Cluster_4dummy_df$prob_1 <- 0
+Cluster_4dummy_df$prob_2 <- 0
+Cluster_4dummy_df$prob_3 <- 0
+Cluster_4dummy_df$prob_4 <- 1
+Cluster_4dummy_df$prob_5 <- 0
+Cluster_4dummy_df$prob_6 <- 0
+Cluster_4dummy_df$prob_7 <- 0
+Cluster_4dummy_df$prob_8 <- 0
+
+Cluster_5dummy_df <- dummy_df
+
+Cluster_5dummy_df$cluster_1 <- 0
+Cluster_5dummy_df$cluster_2 <- 0
+Cluster_5dummy_df$cluster_3 <- 0
+Cluster_5dummy_df$cluster_4 <- 0
+Cluster_5dummy_df$cluster_6 <- 0
+Cluster_5dummy_df$cluster_7 <- 0
+Cluster_5dummy_df$cluster_8 <- 0
+Cluster_5dummy_df$prob_1 <- 0
+Cluster_5dummy_df$prob_2 <- 0
+Cluster_5dummy_df$prob_3 <- 0
+Cluster_5dummy_df$prob_4 <- 0
+Cluster_5dummy_df$prob_5 <- 1
+Cluster_5dummy_df$prob_6 <- 0
+Cluster_5dummy_df$prob_7 <- 0
+Cluster_5dummy_df$prob_8 <- 0
+
+
+Cluster_6dummy_df <- dummy_df
+
+Cluster_6dummy_df$cluster_1 <- 0
+Cluster_6dummy_df$cluster_2 <- 0
+Cluster_6dummy_df$cluster_3 <- 0
+Cluster_6dummy_df$cluster_4 <- 0
+Cluster_6dummy_df$cluster_5 <- 0
+Cluster_6dummy_df$cluster_7 <- 0
+Cluster_6dummy_df$cluster_8 <- 0
+Cluster_6dummy_df$prob_1 <- 0
+Cluster_6dummy_df$prob_2 <- 0
+Cluster_6dummy_df$prob_3 <- 0
+Cluster_6dummy_df$prob_4 <- 0
+Cluster_6dummy_df$prob_5 <- 0
+Cluster_6dummy_df$prob_6 <- 1
+Cluster_6dummy_df$prob_7 <- 0
+Cluster_6dummy_df$prob_8 <- 0
+
+Cluster_7dummy_df <- dummy_df
+
+Cluster_7dummy_df$cluster_1 <- 0
+Cluster_7dummy_df$cluster_2 <- 0
+Cluster_7dummy_df$cluster_3 <- 0
+Cluster_7dummy_df$cluster_4 <- 0
+Cluster_7dummy_df$cluster_5 <- 0
+Cluster_7dummy_df$cluster_6 <- 0
+Cluster_7dummy_df$cluster_8 <- 0
+Cluster_7dummy_df$prob_1 <- 0
+Cluster_7dummy_df$prob_2 <- 0
+Cluster_7dummy_df$prob_3 <- 0
+Cluster_7dummy_df$prob_4 <- 0
+Cluster_7dummy_df$prob_5 <- 0
+Cluster_7dummy_df$prob_6 <- 0
+Cluster_7dummy_df$prob_7 <- 1
+Cluster_7dummy_df$prob_8 <- 0
+
+
+
+
+Cluster_8dummy_df <- dummy_df
+
+Cluster_8dummy_df$cluster_1 <- 0
+Cluster_8dummy_df$cluster_2 <- 0
+Cluster_8dummy_df$cluster_3 <- 0
+Cluster_8dummy_df$cluster_4 <- 0
+Cluster_8dummy_df$cluster_5 <- 0
+Cluster_8dummy_df$cluster_6 <- 0
+Cluster_8dummy_df$cluster_7 <- 0
+Cluster_8dummy_df$prob_1 <- 0
+Cluster_8dummy_df$prob_2 <- 0
+Cluster_8dummy_df$prob_3 <- 0
+Cluster_8dummy_df$prob_4 <- 0
+Cluster_8dummy_df$prob_5 <- 0
+Cluster_8dummy_df$prob_6 <- 0
+Cluster_8dummy_df$prob_7 <- 0
+Cluster_8dummy_df$prob_8 <- 1
+
+
+
+Cluster_1dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_1dummy_df, type = "raw")
+Cluster_2dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_2dummy_df, type = "raw")
+Cluster_3dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_3dummy_df, type = "raw")
+Cluster_4dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_4dummy_df, type = "raw")
+Cluster_5dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_5dummy_df, type = "raw")
+Cluster_6dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_6dummy_df, type = "raw")
+Cluster_7dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_7dummy_df, type = "raw")
+Cluster_8dummy_df$Predicted_EPA <- predict(prestige.fit_Cluster_1000, newdata = Cluster_8dummy_df, type = "raw")
+
+Cluster_1dummy_df$RunPct
+plot(Predicted_EPA ~ RunPct, data = Cluster_1dummy_df, main = "Cluster 1")
+plot(Predicted_EPA ~ RunPct, data = Cluster_2dummy_df, main = "Cluster 2")
+plot(Predicted_EPA ~ RunPct, data = Cluster_3dummy_df, main = "Cluster 3")
+plot(Predicted_EPA ~ RunPct, data = Cluster_4dummy_df, main = "Cluster 4")
+plot(Predicted_EPA ~ RunPct, data = Cluster_5dummy_df, main = "Cluster 5")
+plot(Predicted_EPA ~ RunPct, data = Cluster_6dummy_df, main = "Cluster 6")
+plot(Predicted_EPA ~ RunPct, data = Cluster_7dummy_df, main = "Cluster 7")
+plot(Predicted_EPA ~ RunPct, data = Cluster_8dummy_df, main = "Cluster 8")
+
+save.image(file='REnvironmentforNN.RData')
+
+
+load("/Users/EvanWeiss/Downloads/REnvironmentforNNOutput.RData")
+
+#starttime <- Sys.time
+set.seed(5678)
+my.grid <- expand.grid(.decay = c(0.5, 0.1), .size = c(5, 6, 7))
+set.seed(5678)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+#Final_DF_WPBinned
+set.seed(5678)
+#prestige.fit <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(prestige.train),
+ #                     method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1) 
+
+set.seed(5678)
+prestige.fit1 <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_GameLevel),
+                       method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+set.seed(5678)
+prestige.fit100 <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7), data = na.omit(Final_DF_GameLevel),
+                         method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+
+set.seed(5678)
+prestige.fit_Cluster_1000 <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_GameLevel),
+                       method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)
+
+
+set.seed(5678)
+prestige.fit_Cluster_WP_1000 <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_WPBinned),
+                                   method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)
+
+
+
+
+
+set.seed(5678)
+prestige.fit_Probs_1000 <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7), data = na.omit(Final_DF_GameLevel),
+                         method = "nnet", maxit = 1000, tuneGrid = my.grid, trace = F, linout = 1)
+
+###### Test Train
+set.seed(5678)
+trainIndex <- createDataPartition(Final_DF_GameLevel$epa, p=.7, list=F)
+prestige.train <- Final_DF_GameLevel[trainIndex, ]
+prestige.test <- Final_DF_GameLevel[-trainIndex, ]
+#prestige.train
+Weather_classification_Model_Gamelevel_Train <- lm(epa ~  (as.factor(season) +as.factor(defteam) + as.factor(season) + as.factor(offteam) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = prestige.train)
+# Add Cluster_8 below
+#Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_GameLevel))
+Weather_classification_Model_Gamelevel_ForStep_Train <- lm(epa ~  (as.factor(season) + as.factor(defteam) + as.factor(season) + as.factor(offteam) + + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected +  as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(prestige.train))
+
+
+##Weather_classification_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+summary(Weather_classification_Model_Gamelevel)
+
+
+step.Weather_classification_Model_Gamelevel_Train <- stepAIC(Weather_classification_Model_Gamelevel_ForStep_Train, direction = "both", 
+                                                       trace = FALSE)
+
+
+
+Weather_probs_Model_Gamelevel_Train <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = prestige.train)
+
+Weather_probs_Model_Gamelevel_ForStep_Train <- lm(epa ~  (as.factor(season) + as.factor(defteam) + as.factor(season) + as.factor(offteam) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(prestige.train))
+
+step.Weather_probs_Model_Gamelevel_Train <- stepAIC(Weather_probs_Model_Gamelevel_ForStep_Train, direction = "both", 
+                                              trace = FALSE)
+
+set.seed(5678)
+my.grid <- expand.grid(.decay = c(0.5, 0.1), .size = c(5, 6, 7))
+set.seed(5678)
+train_control<- trainControl(method="cv", number=10, savePredictions = TRUE)
+#Final_DF_WPBinned
+set.seed(5678)
+
+set.seed(5678)
+prestige.fit_prob_Train <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(prestige.train),
+                       method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+set.seed(5678)
+prestige.fit_cluster_Train <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(prestige.train),
+                                 method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+prestige.test1 <- prestige.test
+prestige.testAll <- na.omit(prestige.test1)
+
+prestige.testAll$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Train, newdata = prestige.testAll, type = "raw")
+prestige.testAll$NNET_Prob_EPA <- predict(prestige.fit_prob_Train, newdata = prestige.testAll, type = "raw")
+prestige.testAll$FE_Cluster_EPA <- predict(Weather_classification_Model_Gamelevel_Train, newdata = prestige.testAll, type = "response")
+prestige.testAll$FE_Prob_EPA <- predict(Weather_probs_Model_Gamelevel_Train, newdata = prestige.testAll, type = "response")
+prestige.testAll$Step_Cluster_EPA <- predict(step.Weather_classification_Model_Gamelevel_Train, newdata = prestige.testAll, type = "response")
+prestige.testAll$Step_Prob_EPA <- predict(step.Weather_probs_Model_Gamelevel_Train, newdata = prestige.testAll, type = "response")
+
+prestige.testAll$NNET_Cluster_Diff <- sqrt((prestige.testAll$NNET_Cluster_EPA - prestige.testAll$epa)^2)
+prestige.testAll$NNET_Prob_Diff <- sqrt((prestige.testAll$NNET_Prob_EPA - prestige.testAll$epa)^2)
+
+prestige.testAll$FE_Cluster_Diff <- sqrt((prestige.testAll$FE_Cluster_EPA - prestige.testAll$epa)^2)
+prestige.testAll$FE_Prob_Diff <- sqrt((prestige.testAll$FE_Prob_EPA - prestige.testAll$epa)^2)
+
+prestige.testAll$Step_Cluster_Diff <- sqrt((prestige.testAll$Step_Cluster_EPA - prestige.testAll$epa)^2)
+prestige.testAll$Step_Prob_Diff <- sqrt((prestige.testAll$Step_Prob_EPA - prestige.testAll$epa)^2)
+
+mean(prestige.testAll$NNET_Cluster_Diff)
+mean(prestige.testAll$NNET_Prob_Diff)
+
+mean(prestige.testAll$FE_Cluster_Diff)
+mean(prestige.testAll$FE_Prob_Diff)
+
+mean(prestige.testAll$Step_Cluster_Diff)
+mean(prestige.testAll$Step_Prob_Diff)
+
+Final_DF_GameLevel$home_team
+team_list <- list(unique(Final_DF_GameLevel$offteam))
+dummy_df1 <- dummy_df
+team_list_df <- as.data.frame(team_list)
+team_list_df$offteam <- team_list_df$c..LA....PHI....ARI....CAR....DET....KC....CLE....IND....MIN... 
+team_list_df$c..LA....PHI....ARI....CAR....DET....KC....CLE....IND....MIN...  <- NULL
+
+team_list_df_def <- team_list_df
+team_list_df_def$defteam <- team_list_df_def$offteam
+team_list_df_def$offteam <- NULL
+
+team_list_df_home <- team_list_df_def 
+
+team_list_df_home$home_team <- team_list_df_home$defteam 
+team_list_df_home$defteam <- NULL
+
+team_list_all <- merge(team_list_df_def, team_list_df, all=TRUE)
+team_list_all <- filter(team_list_all, offteam != defteam)
+
+
+
+dummy_dftrial <- dummy_df
+dummy_dftrial$offteam <- NULL
+dummy_dftrial$defteam <- NULL
+dummy_dftrial$home_team <- NULL
+dummy_dftrial <- merge(dummy_dftrial, team_list_all, all = TRUE)
+write.csv(dummy_dftrial, "data/dummy_dftrial.csv")
+
+#set hometeam = offteam
+dummy_dftrial$home_team <- dummy_dftrial$offteam
+dummy_dftrial$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Train, newdata = dummy_dftrial, type = "raw")
+dummy_dftrial$NNET_Prob_EPA <- predict(prestige.fit_prob_Train, newdata = dummy_dftrial, type = "raw")
+
+
+Cluster_1dummy_df <- dummy_dftrial
+boxplot.stats(cluster_1filtered$RunPct, coef = 1.5)
+
+Cluster_1dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.2857143 THEN 0.2857143
+                            WHEN RunPct >= 0.5686275 THEN 0.5686275
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_1dummy_df")
+
+Cluster_1dummy_df$RunPct <- Cluster_1dummy_df$RunPct1
+Cluster_1dummy_df$cluster_2 <- 0
+Cluster_1dummy_df$cluster_3 <- 0
+Cluster_1dummy_df$cluster_4 <- 0
+Cluster_1dummy_df$cluster_5 <- 0
+Cluster_1dummy_df$cluster_6 <- 0
+Cluster_1dummy_df$cluster_7 <- 0
+Cluster_1dummy_df$cluster_8 <- 0
+Cluster_1dummy_df$prob_1 <- 1
+Cluster_1dummy_df$prob_2 <- 0
+Cluster_1dummy_df$prob_3 <- 0
+Cluster_1dummy_df$prob_4 <- 0
+Cluster_1dummy_df$prob_5 <- 0
+Cluster_1dummy_df$prob_6 <- 0
+Cluster_1dummy_df$prob_7 <- 0
+Cluster_1dummy_df$prob_8 <- 0
+
+
+
+
+
+
+Cluster_2dummy_df <- dummy_dftrial
+
+boxplot.stats(cluster_2filtered$RunPct, coef = 1.5)
+
+Cluster_2dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.2542373 THEN 0.2542373
+                            WHEN RunPct >= 0.6250000 THEN 0.6250000
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_2dummy_df")
+
+Cluster_2dummy_df$RunPct <- Cluster_2dummy_df$RunPct1
+Cluster_2dummy_df$cluster_1 <- 0
+Cluster_2dummy_df$cluster_3 <- 0
+Cluster_2dummy_df$cluster_4 <- 0
+Cluster_2dummy_df$cluster_5 <- 0
+Cluster_2dummy_df$cluster_6 <- 0
+Cluster_2dummy_df$cluster_7 <- 0
+Cluster_2dummy_df$cluster_8 <- 0
+Cluster_2dummy_df$prob_1 <- 0
+Cluster_2dummy_df$prob_2 <- 1
+Cluster_2dummy_df$prob_3 <- 0
+Cluster_2dummy_df$prob_4 <- 0
+Cluster_2dummy_df$prob_5 <- 0
+Cluster_2dummy_df$prob_6 <- 0
+Cluster_2dummy_df$prob_7 <- 0
+Cluster_2dummy_df$prob_8 <- 0
+
+Cluster_3dummy_df <- dummy_dftrial
+
+
+boxplot.stats(cluster_3filtered$RunPct, coef = 1.5)
+
+Cluster_3dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.1590909 THEN 0.1590909
+                            WHEN RunPct >= 0.6800000 THEN 0.6800000
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_3dummy_df")
+
+Cluster_3dummy_df$RunPct <- Cluster_3dummy_df$RunPct1
+Cluster_3dummy_df$cluster_1 <- 0
+Cluster_3dummy_df$cluster_2 <- 0
+Cluster_3dummy_df$cluster_4 <- 0
+Cluster_3dummy_df$cluster_5 <- 0
+Cluster_3dummy_df$cluster_6 <- 0
+Cluster_3dummy_df$cluster_7 <- 0
+Cluster_3dummy_df$cluster_8 <- 0
+Cluster_3dummy_df$prob_1 <- 0
+Cluster_3dummy_df$prob_2 <- 0
+Cluster_3dummy_df$prob_3 <- 1
+Cluster_3dummy_df$prob_4 <- 0
+Cluster_3dummy_df$prob_5 <- 0
+Cluster_3dummy_df$prob_6 <- 0
+Cluster_3dummy_df$prob_7 <- 0
+Cluster_3dummy_df$prob_8 <- 0
+
+
+Cluster_4dummy_df <- dummy_dftrial
+
+boxplot.stats(cluster_4filtered$RunPct, coef = 1.5)
+
+Cluster_4dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.2222222 THEN 0.2222222
+                            WHEN RunPct >= 0.7254902 THEN 0.7254902
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_4dummy_df")
+
+Cluster_4dummy_df$RunPct <- Cluster_4dummy_df$RunPct1
+Cluster_4dummy_df$cluster_1 <- 0
+Cluster_4dummy_df$cluster_2 <- 0
+Cluster_4dummy_df$cluster_3 <- 0
+Cluster_4dummy_df$cluster_5 <- 0
+Cluster_4dummy_df$cluster_6 <- 0
+Cluster_4dummy_df$cluster_7 <- 0
+Cluster_4dummy_df$cluster_8 <- 0
+Cluster_4dummy_df$prob_1 <- 0
+Cluster_4dummy_df$prob_2 <- 0
+Cluster_4dummy_df$prob_3 <- 0
+Cluster_4dummy_df$prob_4 <- 1
+Cluster_4dummy_df$prob_5 <- 0
+Cluster_4dummy_df$prob_6 <- 0
+Cluster_4dummy_df$prob_7 <- 0
+Cluster_4dummy_df$prob_8 <- 0
+
+Cluster_5dummy_df <- dummy_dftrial
+
+
+boxplot.stats(cluster_5filtered$RunPct, coef = 1.5)
+
+Cluster_5dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.1739130 THEN 0.1739130
+                            WHEN RunPct >= 0.6206897 THEN 0.6206897
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_5dummy_df")
+
+Cluster_5dummy_df$RunPct <- Cluster_5dummy_df$RunPct1
+Cluster_5dummy_df$cluster_1 <- 0
+Cluster_5dummy_df$cluster_2 <- 0
+Cluster_5dummy_df$cluster_3 <- 0
+Cluster_5dummy_df$cluster_4 <- 0
+Cluster_5dummy_df$cluster_6 <- 0
+Cluster_5dummy_df$cluster_7 <- 0
+Cluster_5dummy_df$cluster_8 <- 0
+Cluster_5dummy_df$prob_1 <- 0
+Cluster_5dummy_df$prob_2 <- 0
+Cluster_5dummy_df$prob_3 <- 0
+Cluster_5dummy_df$prob_4 <- 0
+Cluster_5dummy_df$prob_5 <- 1
+Cluster_5dummy_df$prob_6 <- 0
+Cluster_5dummy_df$prob_7 <- 0
+Cluster_5dummy_df$prob_8 <- 0
+
+
+Cluster_6dummy_df <- dummy_dftrial
+
+
+boxplot.stats(cluster_6filtered$RunPct, coef = 1.5)
+
+Cluster_6dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.1666667 THEN 0.1666667
+                            WHEN RunPct >= 0.6842105 THEN 0.6842105
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_6dummy_df")
+
+Cluster_6dummy_df$RunPct <- Cluster_6dummy_df$RunPct1
+Cluster_6dummy_df$cluster_1 <- 0
+Cluster_6dummy_df$cluster_2 <- 0
+Cluster_6dummy_df$cluster_3 <- 0
+Cluster_6dummy_df$cluster_4 <- 0
+Cluster_6dummy_df$cluster_5 <- 0
+Cluster_6dummy_df$cluster_7 <- 0
+Cluster_6dummy_df$cluster_8 <- 0
+Cluster_6dummy_df$prob_1 <- 0
+Cluster_6dummy_df$prob_2 <- 0
+Cluster_6dummy_df$prob_3 <- 0
+Cluster_6dummy_df$prob_4 <- 0
+Cluster_6dummy_df$prob_5 <- 0
+Cluster_6dummy_df$prob_6 <- 1
+Cluster_6dummy_df$prob_7 <- 0
+Cluster_6dummy_df$prob_8 <- 0
+
+Cluster_7dummy_df <- dummy_dftrial
+
+
+
+boxplot.stats(cluster_7filtered$RunPct, coef = 1.5)
+
+Cluster_7dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.1666667 THEN 0.1666667
+                            WHEN RunPct >= 0.6666667 THEN 0.6666667
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_7dummy_df")
+
+Cluster_7dummy_df$RunPct <- Cluster_7dummy_df$RunPct1
+Cluster_7dummy_df$cluster_1 <- 0
+Cluster_7dummy_df$cluster_2 <- 0
+Cluster_7dummy_df$cluster_3 <- 0
+Cluster_7dummy_df$cluster_4 <- 0
+Cluster_7dummy_df$cluster_5 <- 0
+Cluster_7dummy_df$cluster_6 <- 0
+Cluster_7dummy_df$cluster_8 <- 0
+Cluster_7dummy_df$prob_1 <- 0
+Cluster_7dummy_df$prob_2 <- 0
+Cluster_7dummy_df$prob_3 <- 0
+Cluster_7dummy_df$prob_4 <- 0
+Cluster_7dummy_df$prob_5 <- 0
+Cluster_7dummy_df$prob_6 <- 0
+Cluster_7dummy_df$prob_7 <- 1
+Cluster_7dummy_df$prob_8 <- 0
+
+
+
+
+Cluster_8dummy_df <- dummy_dftrial
+
+boxplot.stats(cluster_8filtered$RunPct, coef = 1.5)
+
+Cluster_8dummy_df <- sqldf("SELECT *, 
+                           CASE 
+                            WHEN RunPct <= 0.2000000 THEN 0.2000000
+                            WHEN RunPct >= 0.6363636 THEN 0.6363636
+                            ELSE RunPct
+                           END RunPct1
+                           FROM Cluster_8dummy_df")
+
+Cluster_8dummy_df$RunPct <- Cluster_8dummy_df$RunPct1
+
+Cluster_8dummy_df$cluster_1 <- 0
+Cluster_8dummy_df$cluster_2 <- 0
+Cluster_8dummy_df$cluster_3 <- 0
+Cluster_8dummy_df$cluster_4 <- 0
+Cluster_8dummy_df$cluster_5 <- 0
+Cluster_8dummy_df$cluster_6 <- 0
+Cluster_8dummy_df$cluster_7 <- 0
+Cluster_8dummy_df$prob_1 <- 0
+Cluster_8dummy_df$prob_2 <- 0
+Cluster_8dummy_df$prob_3 <- 0
+Cluster_8dummy_df$prob_4 <- 0
+Cluster_8dummy_df$prob_5 <- 0
+Cluster_8dummy_df$prob_6 <- 0
+Cluster_8dummy_df$prob_7 <- 0
+Cluster_8dummy_df$prob_8 <- 1
+
+
+
+set.seed(5678)
+prestige.fit_prob_Final <- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel),
+                                 method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+set.seed(5678)
+prestige.fit_cluster_Final<- train(epa ~ (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2) + I(RunPct^3))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel),
+                                    method = "nnet", maxit = 10000, tuneGrid = my.grid, trace = F, linout = 1)
+
+
+plot(prestige.fit_prob_Final)
+plot(prestige.fit_cluster_Final)
+library(NeuralNetTools)
+plotnet(prestige.fit_cluster_Final, x_names = "",y_names = "",var_labs = FALSE, node_labs = FALSE, max_sp = TRUE)
+
+
+Cluster_1dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_1dummy_df, type = "raw")
+Cluster_1dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_1dummy_df, type = "raw")
+Cluster_2dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_2dummy_df, type = "raw")
+Cluster_2dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_2dummy_df, type = "raw")
+Cluster_3dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_3dummy_df, type = "raw")
+Cluster_3dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_3dummy_df, type = "raw")
+Cluster_4dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_4dummy_df, type = "raw")
+Cluster_4dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_4dummy_df, type = "raw")
+Cluster_5dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_5dummy_df, type = "raw")
+Cluster_5dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_5dummy_df, type = "raw")
+Cluster_6dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_6dummy_df, type = "raw")
+Cluster_6dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_6dummy_df, type = "raw")
+Cluster_7dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_7dummy_df, type = "raw")
+Cluster_7dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_7dummy_df, type = "raw")
+Cluster_8dummy_df$NNET_Cluster_EPA <- predict(prestige.fit_cluster_Final, newdata = Cluster_8dummy_df, type = "raw")
+Cluster_8dummy_df$NNET_Prob_EPA <- predict(prestige.fit_prob_Final, newdata = Cluster_8dummy_df, type = "raw")
+
+
+
+
+Cluster_1dummy_df_max <- filter(Cluster_1dummy_df, NNET_Cluster_EPA == max(Cluster_1dummy_df$NNET_Cluster_EPA))
+Cluster_2dummy_df_max <- filter(Cluster_2dummy_df, NNET_Cluster_EPA == max(Cluster_2dummy_df$NNET_Cluster_EPA))
+Cluster_3dummy_df_max <- filter(Cluster_3dummy_df, NNET_Cluster_EPA == max(Cluster_3dummy_df$NNET_Cluster_EPA))
+Cluster_4dummy_df_max <- filter(Cluster_4dummy_df, NNET_Cluster_EPA == max(Cluster_4dummy_df$NNET_Cluster_EPA))
+Cluster_5dummy_df_max <- filter(Cluster_5dummy_df, NNET_Cluster_EPA == max(Cluster_5dummy_df$NNET_Cluster_EPA))
+Cluster_6dummy_df_max <- filter(Cluster_6dummy_df, NNET_Cluster_EPA == max(Cluster_6dummy_df$NNET_Cluster_EPA))
+Cluster_7dummy_df_max <- filter(Cluster_7dummy_df, NNET_Cluster_EPA == max(Cluster_7dummy_df$NNET_Cluster_EPA))
+Cluster_8dummy_df_max <- filter(Cluster_8dummy_df, NNET_Cluster_EPA == max(Cluster_8dummy_df$NNET_Cluster_EPA))
+
+Cluster_1dummy_df_maxprobs <- filter(Cluster_1dummy_df, NNET_Prob_EPA == max(Cluster_1dummy_df$NNET_Prob_EPA))
+Cluster_2dummy_df_maxprobs <- filter(Cluster_2dummy_df, NNET_Prob_EPA == max(Cluster_2dummy_df$NNET_Prob_EPA))
+Cluster_3dummy_df_maxprobs <- filter(Cluster_3dummy_df, NNET_Prob_EPA == max(Cluster_3dummy_df$NNET_Prob_EPA))
+Cluster_4dummy_df_maxprobs <- filter(Cluster_4dummy_df, NNET_Prob_EPA== max(Cluster_4dummy_df$NNET_Prob_EPA))
+Cluster_5dummy_df_maxprobs <- filter(Cluster_5dummy_df, NNET_Prob_EPA == max(Cluster_5dummy_df$NNET_Prob_EPA))
+Cluster_6dummy_df_maxprobs <- filter(Cluster_6dummy_df, NNET_Prob_EPA == max(Cluster_6dummy_df$NNET_Prob_EPA))
+Cluster_7dummy_df_maxprobs <- filter(Cluster_7dummy_df, NNET_Prob_EPA == max(Cluster_7dummy_df$NNET_Prob_EPA))
+Cluster_8dummy_df_maxprobs <- filter(Cluster_8dummy_df, NNET_Prob_EPA == max(Cluster_8dummy_df$NNET_Prob_EPA))
+
+
+cluster_1filtered <- filter(Final_DF_GameLevel, cluster_1 == 1)
+cluster_2filtered <- filter(Final_DF_GameLevel, cluster_2 == 1)
+cluster_3filtered <- filter(Final_DF_GameLevel, cluster_3 == 1)
+cluster_4filtered <- filter(Final_DF_GameLevel, cluster_4 == 1)
+cluster_5filtered <- filter(Final_DF_GameLevel, cluster_5 == 1)
+cluster_6filtered <- filter(Final_DF_GameLevel, cluster_6 == 1)
+cluster_7filtered <- filter(Final_DF_GameLevel, cluster_7 == 1)
+cluster_8filtered <- filter(Final_DF_GameLevel, cluster_8 == 1)
+library(stats)
+boxplot.stats(cluster_1filtered$RunPct, coef = 1.5)
+Cluster_1dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2857143
+                                  when RunPct >= 0.02 THEN 0.5686275
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_1dummy_df_max
+                               ")
+
+boxplot.stats(cluster_2filtered$RunPct, coef = 1.5)
+Cluster_2dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2542373
+                                  when RunPct >= 0.02 THEN 0.6250000
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_2dummy_df_max
+                               ")
+
+boxplot.stats(cluster_3filtered$RunPct, coef = 1.5)
+Cluster_3dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1590909
+                                  when RunPct >= 0.02 THEN 0.6800000
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_3dummy_df_max
+                               ")
+
+boxplot.stats(cluster_4filtered$RunPct, coef = 1.5)
+Cluster_4dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2222222
+                                  when RunPct >= 0.02 THEN 0.7254902
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_4dummy_df_max
+                               ")
+
+boxplot.stats(cluster_5filtered$RunPct, coef = 1.5)
+Cluster_5dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1739130
+                                  when RunPct >= 0.02 THEN 0.6206897
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_5dummy_df_max
+                               ")
+
+
+boxplot.stats(cluster_6filtered$RunPct, coef = 1.5)
+Cluster_6dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1666667
+                                  when RunPct >= 0.02 THEN 0.6842105
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_6dummy_df_max
+                               ")
+
+boxplot.stats(cluster_7filtered$RunPct, coef = 1.5)
+Cluster_7dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1666667
+                                  when RunPct >= 0.02 THEN 0.6666667
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_7dummy_df_max
+                               ")
+
+boxplot.stats(cluster_8filtered$RunPct, coef = 1.5)
+Cluster_8dummy_df_max <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2000000
+                                  when RunPct >= 0.02 THEN 0.6363636
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_8dummy_df_max
+                               ")
+
+Cluster_1dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2857143
+                                  when RunPct >= 0.02 THEN 0.5686275
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_1dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_2filtered$RunPct, coef = 1.5)
+Cluster_2dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2542373
+                                  when RunPct >= 0.02 THEN 0.6250000
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_2dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_3filtered$RunPct, coef = 1.5)
+Cluster_3dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1590909
+                                  when RunPct >= 0.02 THEN 0.6800000
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_3dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_4filtered$RunPct, coef = 1.5)
+Cluster_4dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2222222
+                                  when RunPct >= 0.02 THEN 0.7254902
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_4dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_5filtered$RunPct, coef = 1.5)
+Cluster_5dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1739130
+                                  when RunPct >= 0.02 THEN 0.6206897
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_5dummy_df_maxprobs
+                               ")
+
+
+boxplot.stats(cluster_6filtered$RunPct, coef = 1.5)
+Cluster_6dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1666667
+                                  when RunPct >= 0.02 THEN 0.6842105
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_6dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_7filtered$RunPct, coef = 1.5)
+Cluster_7dummy_df_maxprobs<- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.1666667
+                                  when RunPct >= 0.02 THEN 0.6666667
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_7dummy_df_maxprobs
+                               ")
+
+boxplot.stats(cluster_8filtered$RunPct, coef = 1.5)
+Cluster_8dummy_df_maxprobs <- sqldf("select *, 
+                                case 
+                                  when RunPct <= 0.02 THEN 0.2000000
+                                  when RunPct >= 0.02 THEN 0.6363636
+                                ELSE RunPct END NNET_OptimalRunPct
+                                FROM Cluster_8dummy_df_maxprobs
+                               ")
+
+
+
+mean(Cluster_1dummy_df$NNET_Cluster_EPA)
+mean(Cluster_2dummy_df$NNET_Cluster_EPA)
+mean(Cluster_3dummy_df$NNET_Cluster_EPA)
+mean(Cluster_4dummy_df$NNET_Cluster_EPA)
+mean(Cluster_5dummy_df$NNET_Cluster_EPA)
+mean(Cluster_6dummy_df$NNET_Cluster_EPA)
+mean(Cluster_7dummy_df$NNET_Cluster_EPA)
+mean(Cluster_8dummy_df$NNET_Cluster_EPA)
+
+mean(Cluster_1dummy_df$NNET_Prob_EPA)
+mean(Cluster_2dummy_df$NNET_Prob_EPA)
+mean(Cluster_3dummy_df$NNET_Prob_EPA)
+mean(Cluster_4dummy_df$NNET_Prob_EPA)
+mean(Cluster_5dummy_df$NNET_Prob_EPA)
+mean(Cluster_6dummy_df$NNET_Prob_EPA)
+mean(Cluster_7dummy_df$NNET_Prob_EPA)
+mean(Cluster_8dummy_df$NNET_Prob_EPA)
+
+
+Final1 <- filter(Final_DF_GameLevel, cluster_1 == 1)
+Final2 <- filter(Final_DF_GameLevel, cluster_2 == 1)
+Final3 <- filter(Final_DF_GameLevel, cluster_3 == 1)
+Final4 <- filter(Final_DF_GameLevel, cluster_4 == 1)
+Final5 <- filter(Final_DF_GameLevel, cluster_5 == 1)
+Final6 <- filter(Final_DF_GameLevel, cluster_6 == 1)
+Final7 <- filter(Final_DF_GameLevel, cluster_7 == 1)
+Final8 <- filter(Final_DF_GameLevel, cluster_8 == 1)
+
+Cluster_1_avg_RunPct <- mean(Final1$RunPct)
+Cluster_2_avg_RunPct <- mean(Final2$RunPct)
+Cluster_3_avg_RunPct <- mean(Final3$RunPct)
+Cluster_4_avg_RunPct <- mean(Final4$RunPct)
+Cluster_5_avg_RunPct <- mean(Final5$RunPct)
+Cluster_6_avg_RunPct <- mean(Final6$RunPct)
+Cluster_7_avg_RunPct <- mean(Final7$RunPct)
+Cluster_8_avg_RunPct <- mean(Final8$RunPct)
+
+
+
+
+NNET_Prob_EPA_data <- tibble()
+#NNET_Prob_EPA_data <- data.frame(Cluster1 = mean(Cluster_1dummy_df$NNET_Prob_EPA), Cluster2 = mean(Cluster_2dummy_df$NNET_Prob_EPA),Cluster3 = mean(Cluster_3dummy_df$NNET_Prob_EPA) ,Cluster4 = mean(Cluster_4dummy_df$NNET_Prob_EPA), Cluster5 = mean(Cluster_5dummy_df$NNET_Prob_EPA),Cluster6 = mean(Cluster_6dummy_df$NNET_Prob_EPA), Cluster7 = (mean(Cluster_7dummy_df$NNET_Prob_EPA) ,Cluster8 = mean(Cluster_1dummy_df$NNET_Prob_EPA)))
+NNET_Prob_EPA_data <- data.frame(Cluster = c("Cluster_1","Cluster_2","Cluster_3","Cluster_4","Cluster_5","Cluster_6","Cluster_7","Cluster_8"), Mean_EPA = c(mean(Cluster_1dummy_df$NNET_Prob_EPA), mean(Cluster_2dummy_df$NNET_Prob_EPA), mean(Cluster_3dummy_df$NNET_Prob_EPA),mean(Cluster_4dummy_df$NNET_Prob_EPA),mean(Cluster_5dummy_df$NNET_Prob_EPA),mean(Cluster_6dummy_df$NNET_Prob_EPA),mean(Cluster_7dummy_df$NNET_Prob_EPA), mean(Cluster_8dummy_df$NNET_Prob_EPA)))
+  
+
+
+
+
+NNET_Prob_EPA_data <- data.frame(Cluster1 = mean(Cluster_1dummy_df$NNET_Prob_EPA), Cluster2 = mean(Cluster_2dummy_df$NNET_Prob_EPA), Cluster3 = mean(Cluster_3dummy_df$NNET_Prob_EPA), Cluster4 = mean(Cluster_4dummy_df$NNET_Prob_EPA), Cluster5 = mean(Cluster_5dummy_df$NNET_Prob_EPA), Cluster6 = mean(Cluster_6dummy_df$NNET_Prob_EPA), Cluster7 = (mean(Cluster_7dummy_df$NNET_Prob_EPA)))                            
+NNET_Prob_EPA_data$Cluster8 <- (Cluster8 = mean(Cluster_8dummy_df$NNET_Prob_EPA))                                  
+                                 
+                                 
+                                 
+NNET_Prob_EPA_data$Cluster1 <- mean(Cluster_1dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster2 <- mean(Cluster_2dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster3 <- mean(Cluster_3dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster4 <- mean(Cluster_4dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster5 <- mean(Cluster_5dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster6 <- mean(Cluster_6dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster7 <- mean(Cluster_7dummy_df$NNET_Prob_EPA)
+NNET_Prob_EPA_data$Cluster8 <- mean(Cluster_8dummy_df$NNET_Prob_EPA)
+
+
+
+Cluster_1dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_1dummy_df_maxprobs")
+Cluster_2dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_2dummy_df_maxprobs")
+Cluster_3dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_3dummy_df_maxprobs")
+Cluster_4dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_4dummy_df_maxprobs")
+Cluster_5dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_5dummy_df_maxprobs")
+Cluster_6dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_6dummy_df_maxprobs")
+Cluster_7dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_7dummy_df_maxprobs")
+Cluster_8dummy_df_maxprobs <- sqldf("SELECT DISTINCT * FROM Cluster_8dummy_df_maxprobs")
+
+
+Cluster_1dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_1dummy_df_max")
+Cluster_2dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_2dummy_df_max")
+Cluster_3dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_3dummy_df_max")
+Cluster_4dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_4dummy_df_max")
+Cluster_5dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_5dummy_df_max")
+Cluster_6dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_6dummy_df_max")
+Cluster_7dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_7dummy_df_max")
+Cluster_8dummy_df_max <- sqldf("SELECT DISTINCT * FROM Cluster_8dummy_df_max")
+
+
+RunPcts_df <- data.frame(NNetClusterOptimalRun = c(Cluster_1dummy_df_max$NNET_OptimalRunPct, Cluster_2dummy_df_max$NNET_OptimalRunPct,  Cluster_3dummy_df_max$NNET_OptimalRunPct, Cluster_4dummy_df_max$NNET_OptimalRunPct, Cluster_5dummy_df_max$NNET_OptimalRunPct, Cluster_6dummy_df_max$NNET_OptimalRunPct, Cluster_7dummy_df_max$NNET_OptimalRunPct, Cluster_8dummy_df_max$NNET_OptimalRunPct) , 
+        NNetProbOptimalRun = c(Cluster_1dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_2dummy_df_maxprobs$NNET_OptimalRunPct,  Cluster_3dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_4dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_5dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_6dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_7dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_8dummy_df_maxprobs$NNET_OptimalRunPct) , FE_OptimalRun = c(cluster_1_local_max, cluster_2_local_max, cluster_3_local_max, cluster_4_local_max,cluster_5_local_max, cluster_6_local_max, cluster_7_local_max, cluster_8_local_max), AvgRunPct = c(Cluster_1_avg_RunPct, Cluster_2_avg_RunPct, Cluster_3_avg_RunPct, Cluster_4_avg_RunPct, Cluster_5_avg_RunPct, Cluster_6_avg_RunPct, Cluster_7_avg_RunPct, Cluster_8_avg_RunPct), Cluster = c("Cluster_1", "Cluster_2", "Cluster_3", "Cluster_4", "Cluster_5", "Cluster_6", "Cluster_7", "Cluster_8"))
+#RunPcts_df <- NULL
+
+RunPcts_Stepwise_df <- data.frame(NNetClusterOptimalRun = c(Cluster_4dummy_df_max$NNET_OptimalRunPct, Cluster_6dummy_df_max$NNET_OptimalRunPct, Cluster_7dummy_df_max$NNET_OptimalRunPct, 
+                         Cluster_4dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_6dummy_df_maxprobs$NNET_OptimalRunPct, Cluster_7dummy_df_maxprobs$NNET_OptimalRunPct) , Stepwise_OptimalRun = c(cluster_4_Stepwise_local_max, cluster_6_Step_local_max, cluster_7_Step_local_max), AvgRunPct = c(Cluster_4_avg_RunPct, Cluster_6_avg_RunPct, Cluster_7_avg_RunPct), Cluster = c("Cluster_4", "Cluster_6", "Cluster_7"))
+
+
+
+RunPcts_Stepwise_df_Pilot <- rank(RunPcts_Stepwise_df$Stepwise_OptimalRun, RunPcts_Stepwise_df$NNetClusterOptimalRun, RunPcts_Stepwise_df$AvgRunPct)
+RunPcts_Stepwise_df$Stepwise_OptimalRunRank <- rank(RunPcts_Stepwise_df$Stepwise_OptimalRun)
+RunPcts_Stepwise_df$AvgRunPctRank <- rank(RunPcts_Stepwise_df$AvgRunPct)
+RunPcts_Stepwise_df$NNetClusterOptimalRunRank <- rank(RunPcts_Stepwise_df$NNetClusterOptimalRun)
+
+
+
+
+
+
+Cluster_1dummy_df_max
+NNET_Prob_EPA_data1 <- pivot_longer(NNET_Prob_EPA_data, names_to = "cluster")
+
+Cluster_FE_Coefs_Table <- as.data.frame(Weather_classification_Model_Gamelevel$coefficients)
+Cluster_Step_Coefs_Table <- as.data.frame(step.Weather_classification_Model_Gamelevel$coefficients)
+
+###Parrellel Coordinate Code.  Need to run all code above.
+
+# Libraries
+library(GGally)
+RunPcts_df$NNetProbOptimalRun <- NULL
+
+ggparcoord(RunPcts_df, scale="globalminmax",
+           columns = 1:3, groupColumn = 4
+) 
+#RunPcts_Stepwise_df <- sqldf("select NNetClusterOptimalRun, AvgRunPct, Stepwise_OptimalRun, CASE WHEN Cluster = 'Cluster_4' THEN 'A' WHEN Cluster = 'Cluster_6' THEN 'B' WHEN Cluster = 'Cluster_7' THEN 'C' ELSE 'Other' End Cluster from RunPcts_Stepwise_df")
+RunPcts_Stepwise_df <- sqldf("select distinct NNetClusterOptimalRun, AvgRunPct, Stepwise_OptimalRun, Cluster from RunPcts_Stepwise_df")
+RunPcts_Stepwise_df$Cluster
+write.csv(RunPcts_Stepwise_df, "data/ParrellelCoordinateData.csv")
+#RunPcts_Stepwise_df <- read.csv("ParrellelCoordinateData.csv")
+
+ggparcoord(RunPcts_Stepwise_df,scale="globalminmax",
+           columns = 1:3, groupColumn = 4
+) 
+
+
+write.csv(Cluster_FE_Coefs_Table, "Fixed_Effects_ClusterCoefs.csv")
+write.csv(Cluster_Step_Coefs_Table, "Step_ClusterCoefs.csv")
+
+Fixed_Effects_ClusterCoefs <- read.csv("Fixed_Effects_ClusterCoefs.csv")
+
+Fixed_Effects_ClusterCoefs$Variable <- Fixed_Effects_ClusterCoefs$X
+Fixed_Effects_ClusterCoefs$X <- NULL
+Fixed_Effects_ClusterCoefs$Coefs <- Fixed_Effects_ClusterCoefs$Weather_classification_Model_Gamelevel.coefficients
+Fixed_Effects_ClusterCoefs$Weather_classification_Model_Gamelevel.coefficients <- NULL
+
+
+
+#the following finds the local maxima between intervals min_x and max_x. This is vectorized.
+findLocalMaximaSquare <- function(constant, linear, quadratic, min_x, max_x){
+  #return(list(x=findLocalMaximaSquareX(constant, linear, quadratic, min_x, max_x),y=findLocalMaximaSquareY(constant, linear, quadratic, min_x, max_x)))
+  y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+  y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+  second_derivative <- quadratic * 2
+  x_slope_0 <- linear / (-2*quadratic)
+  y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0
+  return(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+}
+
+#Cluster 1
+
+boxplot.stats(cluster_1filtered$RunPct, coef = 1.5)
+min_x <- 0.2857143
+max_x <- 0.5686275
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_1")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_1")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0         
+
+#Cluster_1_Maximafun_DF <- data.frame(min_x = 0.2857143, max_x = 0.5686275, constant = 0, linear = ((filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[2] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_1")[2])), quadratic = ((filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[2] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_1")[2])))
+#Cluster_1_Maximafun_DF$linear <- Cluster_1_Maximafun_DF$Coefs
+#Cluster_1_Maximafun_DF$quadratic <- Cluster_1_Maximafun_DF$Coefs.1
+#Cluster_1_Maximafun_DF$Coefs <- NULL
+#Cluster_1_Maximafun_DF$Coefs.1 <- NULL
+#Cluster_1_Maximafun_DF$linear
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+findLocalMaximaSquare(Cluster_1_Maximafun_DF)
+
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 1 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+            
+cluster_1_local_max <- local_maxima[[1]]
+#Cluster 2
+
+boxplot.stats(cluster_2filtered$RunPct, coef = 1.5)
+min_x <- 0.2542373
+max_x <- 0.6250000
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_2")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_2")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 2 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+
+cluster_2_local_max <- local_maxima[[1]]
+
+#Cluster 3
+
+boxplot.stats(cluster_3filtered$RunPct, coef = 1.5)
+min_x <- 0.1590909
+max_x <- 0.6800000
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_3")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_3")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 3 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_3_local_max <- local_maxima[[1]]
+#Cluster 4
+
+boxplot.stats(cluster_4filtered$RunPct, coef = 1.5)
+min_x <- 0.2222222
+max_x <- 0.7254902
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_4")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_4")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Inflection Point A")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_4_local_max <- local_maxima[[1]]
+
+#Cluster 5
+
+boxplot.stats(cluster_5filtered$RunPct, coef = 1.5)
+min_x <- 0.1739130
+max_x <- 0.6206897
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_5")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_5")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 5 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+
+cluster_5_local_max <- local_maxima[[1]]
+
+#Cluster 6
+
+boxplot.stats(cluster_6filtered$RunPct, coef = 1.5)
+min_x <- 0.1666667
+max_x <- 0.6842105
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_6")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_6")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Inflection Point B")
+saveImage(print(plotLocalMaximaSquareViz))
+
+
+cluster_6_local_max <- local_maxima[[1]]
+
+
+#Cluster 7
+
+boxplot.stats(cluster_7filtered$RunPct, coef = 1.5)
+min_x <- 0.1666667
+max_x <- 0.6666667
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_7")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_7")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Inflection Point C")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_7_local_max <- local_maxima[[1]]
+
+
+#Cluster 8
+
+boxplot.stats(cluster_8filtered$RunPct, coef = 1.5)
+min_x <- 0.2000000
+max_x <- 0.6363636
+constant <- 0
+linear <- (filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "RunPct:cluster_8")[[2]])
+quadratic <- (filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Fixed_Effects_ClusterCoefs, Variable == "I(RunPct^2):cluster_8")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))[2]
+
+
+print(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 8")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_8_local_max <- local_maxima[[1]]
+
+
+library(tidyverse)
+Fixed_Effects_ClusterCoefs
+
+saveImage <- function(ggplotToSave, widthPixels=1024, heightPixels=1024, filename = "", dpi=300, format="png"){
+  sysinf <- Sys.info()
+  os <- sysinf['sysname']
+  if(os == "Mac"){
+    systemDPI = 96
+  }else{
+    systemDPI = 72
+  }
+  if (filename == ""){
+    filename <-paste0(deparse(substitute(plot)),".",format)
+  }
+  width = widthPixels/systemDPI
+  height=heightPixels/systemDPI
+  print(paste0("Saving ", filename, " with a width of ", width, " and height of ", height, " (", dpi, "dpi) assuming system DPI of ", systemDPI ))
+  print(ggplotToSave)
+  ggsave(filename = filename, width = width, height=height, dpi=dpi)
+}
+
+
+
+findLocalMaximaSquare(step.Weather_probs_Model_Gamelevel)
+step.Weather_probs_Model_Gamelevel$coefficients
+
+Probs_Stepwise_Coefs_Table <- as.data.frame(step.Weather_probs_Model_Gamelevel$coefficients)
+
+
+
+#the following finds the local maxima between intervals min_x and max_x. This is vectorized.
+findLocalMaximaSquare <- function(constant, linear, quadratic, min_x, max_x){
+  #return(list(x=findLocalMaximaSquareX(constant, linear, quadratic, min_x, max_x),y=findLocalMaximaSquareY(constant, linear, quadratic, min_x, max_x)))
+  y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+  y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+  second_derivative <- quadratic * 2
+  x_slope_0 <- linear / (-2*quadratic)
+  y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0
+  return(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+}
+
+plotLocalMaximaSquare <- function(constant, linear, quadratic, min_x, max_x){
+  local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+  x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+  y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+  plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima$y) + geom_vline(xintercept = local_maxima$x)
+  print(plotLocalMaximaSquareViz)
+  return(plotLocalMaximaSquareViz)
+  
+}
+plotLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+
+
+##Let try Stepwise
+
+
+
+Step_ClusterCoefs <- read.csv("data/Step_ClusterCoefs.csv")
+
+Step_ClusterCoefs$Variable <- Step_ClusterCoefs$X
+Step_ClusterCoefs$X <- NULL
+Step_ClusterCoefs$Coefs <- Step_ClusterCoefs$step.Weather_classification_Model_Gamelevel.coefficients
+Step_ClusterCoefs$step.Weather_classification_Model_Gamelevel.coefficients <- NULL
+
+######### Stepwise Cluster 4 ##########
+
+
+boxplot.stats(cluster_4filtered$RunPct, coef = 1.5)
+min_x <- 0.2222222
+max_x <- 0.7254902
+constant <- 0
+linear <- (filter(Step_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Step_ClusterCoefs, Variable == "RunPct:cluster_4")[[2]])
+quadratic <- (filter(Step_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Step_ClusterCoefs, Variable == "I(RunPct^2):cluster_4")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 4 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_4_Stepwise_local_max <- local_maxima[[1]]
+
+
+######### Stepwise Cluster 6 ##########
+
+
+boxplot.stats(cluster_6filtered$RunPct, coef = 1.5)
+min_x <- 0.1666667
+max_x <- 0.6842105
+constant <- 0
+linear <- (filter(Step_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Step_ClusterCoefs, Variable == "RunPct:cluster_6")[[2]])
+quadratic <- (filter(Step_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Step_ClusterCoefs, Variable == "I(RunPct^2):cluster_6")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 6 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+
+cluster_6_Step_local_max <- local_maxima[[1]]
+
+####### STEP Cluster 7 ####### 
+
+boxplot.stats(cluster_7filtered$RunPct, coef = 1.5)
+min_x <- 0.1666667
+max_x <- 0.6666667
+constant <- 0
+linear <- (filter(Step_ClusterCoefs, Variable == "RunPct")[[2]] + filter(Step_ClusterCoefs, Variable == "RunPct:cluster_7")[[2]])
+quadratic <- (filter(Step_ClusterCoefs, Variable == "I(RunPct^2)")[[2]] + filter(Step_ClusterCoefs, Variable == "I(RunPct^2):cluster_7")[[2]])
+
+y_at_min_x <- constant + linear * min_x + quadratic * min_x * min_x
+y_at_min_x
+y_at_max_x <- constant + linear * max_x + quadratic * max_x * max_x
+y_at_max_x
+second_derivative <- quadratic * 2
+second_derivative
+x_slope_0 <- linear / (-2*quadratic)
+x_slope_0
+y_x_slope_0 <- constant + linear * x_slope_0 + quadratic * x_slope_0 * x_slope_0            
+y_x_slope_0    
+
+list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x)))
+
+
+local_maxima <- findLocalMaximaSquare(constant, linear, quadratic, min_x, max_x)
+local_maxima <- unlist(list(x=ifelse(second_derivative < 0, x_slope_0, ifelse(y_at_min_x > y_at_max_x, min_x,max_x)),y=ifelse(second_derivative < 0, y_x_slope_0, ifelse(y_at_min_x > y_at_max_x, y_at_min_x,y_at_max_x))))
+x_seq <- seq(min_x, max_x, (max_x-min_x)/100)
+y_values <- constant + linear * x_seq + quadratic * x_seq * x_seq
+plotLocalMaximaSquareViz <- ggplot(data=tibble(x=x_seq,y=y_values),aes(x=x,y=y)) + geom_line() + geom_hline(yintercept =local_maxima[[2]]) + geom_vline(xintercept = local_maxima[[1]]) + ggtitle("Cluster 7 Inflection Point")
+saveImage(print(plotLocalMaximaSquareViz))
+
+cluster_7_Step_local_max <- local_maxima[[1]]
+
+#####
+Weather_classification_Model_Gamelevel <- lm(epa ~  (as.factor(season) +as.factor(defteam) + as.factor(season) + as.factor(offteam) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+# Add Cluster_8 below
+#Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season)  + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7), data = na.omit(Final_DF_GameLevel))
+Weather_classification_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season) + as.factor(defteam) + as.factor(season) + as.factor(offteam) + + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height + HandSizeOverExpected +  as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = na.omit(Final_DF_GameLevel))
+
+
+##Weather_classification_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(total_line) + as.factor(surface) + Height + HandSize + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+(RunPct + I(RunPct^2))*(cluster_1 + cluster_2 + cluster_3 + cluster_4 + cluster_5 + cluster_6 + cluster_7 + cluster_8), data = Final_DF_GameLevel)
+summary(Weather_classification_Model_Gamelevel)
+
+
+step.Weather_classification_Model_Gamelevel<- stepAIC(Weather_classification_Model_Gamelevel_ForStep, direction = "both", 
+                                                             trace = FALSE)
+
+
+
+Weather_probs_Model_Gamelevel <- lm(epa ~  (as.factor(season) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(offteam)+ as.factor(defteam)+ as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = Final_DF_GameLevel)
+
+Weather_probs_Model_Gamelevel_ForStep <- lm(epa ~  (as.factor(season) + as.factor(defteam) + as.factor(season) + as.factor(offteam) + as.numeric(spread_line) + as.numeric(AdjustedTotalLine) + as.factor(surface) + Height  + HandSizeOverExpected + as.factor(home_team))+ (RunPct + I(RunPct^2))*(prob_1 + prob_2 + prob_3 + prob_4 + prob_5 + prob_6 + prob_7 + prob_8), data = na.omit(Final_DF_GameLevel))
+
+step.Weather_probs_Model_Gamelevel <- stepAIC(Weather_probs_Model_Gamelevel_ForStep, direction = "both", 
+                                                    trace = FALSE)
+summary(Weather_probs_Model_Gamelevel)
+summary(step.Weather_probs_Model_Gamelevel)
+
+stargazer(Weather_probs_Model_Gamelevel, Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (  FE).txt",align=TRUE)
+stargazer(step.Weather_probs_Model_Gamelevel, step.Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (   Stepwise).txt",align=TRUE)
+stargazer(step.Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (Stepwise Cluster).txt",align=TRUE)
+stargazer(step.Weather_probs_Model_Gamelevel, title="Impact of Weather on EPA", out = "GameLevel (Stepwise Probs).txt",align=TRUE)
+summary(Weather_probs_Model_Gamelevel)
+
+library("texreg")
+screenreg(list(step.Weather_probs_Model_Gamelevel, step.Weather_classification_Model_Gamelevel))
+texreg(list(step.Weather_probs_Model_Gamelevel, step.Weather_classification_Model_Gamelevel),out = "Screenreg.txt")
+stargazer(step.Weather_probs_Model_Gamelevel, step.Weather_classification_Model_Gamelevel, title="Impact of Weather on EPA", type = "html",out = "GameLevel (Stepwise).doc",align=TRUE, single.row = TRUE)
+
+
+summary(step.Weather_probs_Model_Gamelevel)
+
+save.image(file='NewestREnvironmentforWeatherProject.RData')
+
+
+Final_DF_GameLevel_cluster6 <- filter(Final_DF_GameLevel, cluster_6 == 1)
+
+unique(Final_DF_GameLevel_cluster6$offteam)
+
+
+Final_DF_GameLevel_cluster6 <- sqldf("SELECT SUM(1) games, offteam from Final_DF_GameLevel_cluster6 group by offteam  ")
+Final_DF_GameLevel_cluster6
+library(fmsb)
+radarchart(df, axistype, seg, pty, pcol, plty, plwd, pdensity, pangle, pfcol, 
+           cglty, cglwd, cglcol, axislabcol, title, maxmin, na.itp, centerzero, 
+           vlabels, vlcex, caxislabels, calcex, paxislabels, palcex, ...)
+```
+
