@@ -102,10 +102,7 @@ for (i in 1:nrow(weather_data_agg)) {
     title = row.names(weather_data_agg[i,])
   )
 }
-#save 1551 x 576
-#dev.off()
-#dev.print(device=pdf,"visualizations/radar_charts.pdf",width=20,height=15) # Print the chart
-#par <- par(opar) # restore standard par settings
+
 ```
 
 
@@ -147,64 +144,6 @@ leagueMean <- "#8CE071"
 
 
 
-```{r}
-data <- read.csv(text="acteur,theme1,theme2,theme3,theme4,theme5,theme6
-acteur1,6,15,9,,,
-acteur2,2,12,13,1,2,
-acteur3,16,,5,4,5,
-acteur4,12,3,14,,1,
-acteur5,13,,17,,,
-acteur6,11,2,10,6,1,
-acteur7,4,8,14,2,,2
-acteur8,13,5,12,,,
-acteur9,21,,9,,,
-acteur10,3,10,15,1,1,
-acteur11,11,3,14,1,1,",stringsAsFactors=FALSE)
-data[is.na(data)] <- 0
-#https://ourednik.info/maps/2020/04/29/radar-charts-with-r/
-# Put the line labels in rownames
-rownames(data)<-data$acteur
-data_raw <- data
-#ggradar plot
-mutate_at(data_raw,vars(-acteur),rescale) %>% ggradar()
-data$acteur <- NULL
-
-# Fetch minima and maxima of every column of the data-set ---- 
-colMax <- function (x) { apply(x, MARGIN=c(2), max) }
-colMin <- function (x) { apply(x, MARGIN=c(2), min) }
-maxmin <- data.frame(max=colMax(data),min=colMin(data))
-
-# Calculate the average profile ----
-average <- data.frame(rbind(maxmin$max,maxmin$min,t(colMeans(data))))
-colnames(average) <- colnames(data)
-radarchart(average)
-
-# Produce multiple plots ----
-opar <- par() # save standard page layout settings for later restoration
-# Define settings for plotting in a 3x4 grid, with appropriate margins:
-par(mar=rep(0.8,4))
-par(mfrow=c(3,4))
-# Iterate through the data, producing a radar-chart for each line
-for (i in 1:nrow(data)) {
-  toplot <- rbind(
-    maxmin$max,
-    maxmin$min,
-    average[3,],
-    data[i,]
-  )
-  radarchart(
-    toplot,
-    pfcol = c("#99999980",NA),
-    pcol= c(NA,2),
-    pty = 32, 
-    plty = 1,
-    plwd = 2,
-    title = row.names(data[i,])
-  )
-}
-dev.print(device=pdf,"radarcharts.pdf",width=20,height=15) # Print the chart
-par <- par(opar) # restore standard par settings
-```
 
 ```{r}
 
